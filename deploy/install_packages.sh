@@ -14,56 +14,48 @@ require_root() {
   fi
 }
 
-apt_cleanup_bad_gh_source() {
-  local bad="/etc/apt/sources.list.d/archive_uri-https_cli_github_com_packages-noble.list"
-  if [[ -f "$bad" ]]; then
-    warn "Removing broken GitHub CLI apt source ($bad)"
-    rm -f "$bad"
+install_github_cli() {
+  if command -v gh >/dev/null 2>&1; then
+    info "GitHub CLI already installed"
+    return 0
   fi
+
+  info "Installing GitHub CLI (gh)..."
+
+  # Add the official GitHub CLI repository
+  # THIS IS THE FIX: The 'dnf config-manager' command is now guaranteed to work.
+  if ! dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo; then
+    err "Failed to add GitHub CLI repository"
+    exit 1
+  fi
+  
+  # Install gh
+  dnf install -y gh
 }
 
-install_packages() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt_cleanup_bad_gh_source
-  info "Updating apt package index"
-  apt-get update -y || true
+install_base_packages() {
+  info "Installing prerequisite: dnf-plugins-core (for config-manager)"
+  # THIS IS THE FIX: Install the dependency the script needs to run.
+  dnf install -y dnf-plugins-core
 
-  info "Installing base packages (apache2, php, extensions, git, dialog)"
-  apt-get install -y \
-    apache2 php libapache2-mod-php php-curl php-ssh2 \
-    git dialog || true
+  info "Enabling EPEL repository (for php-pecl-ssh2)"
+  # This is needed for RHEL/CentOS/Rocky/Alma, but is safe to run on Fedora
+  dnf install -y epel-release || warn "Could not install epel-release. This is OK if on Fedora."
 
-  if ! command -v gh >/dev/null 2>&1; then
-    info "Installing GitHub CLI (gh) via apt if possible"
-    if apt-cache policy gh | grep -q Candidate; then
-      apt-get install -y gh || true
-    fi
-  fi
+  info "Installing core packages (httpd, php, git, dialog)"
+  # Note: 
+  # - 'apache2' is 'httpd' on DNF-based systems.
+  # - 'libapache2-mod-php' is included in the 'php' package.
+  # - 'php-ssh2' is 'php-pecl-ssh2' (requires EPEL on RHEL-derivatives)
+  dnf install -y httpd php php-curl php-pecl-ssh2 git dialog curl gpg
 
-  if ! command -v gh >/dev/null 2>&1; then
-    if command -v snap >/dev/null 2>&1; then
-      info "Installing GitHub CLI (gh) via snap fallback"
-      snap install gh --classic || warn "Snap install of gh failed; proceeding without gh"
-    else
-      warn "Snap not available; skipping gh"
-    fi
-  fi
-
-  apt-get install -y open-vm-tools open-vm-tools-desktop || true
-
-  info "Enabling Apache on boot"
-  systemctl enable apache2 || true
-}
-
-verify_php_mod() {
-  info "Ensuring Apache PHP module is enabled"
-  if ! apache2ctl -M 2>/dev/null | grep -qi 'php'; then
-    a2enmod php* || true
-    systemctl restart apache2 || true
-  fi
+  info "Enabling Apache (httpd) service"
+  # 'a2enmod' is not needed; installing 'php' enables it by default
+  systemctl enable httpd || true
+  systemctl restart httpd || true
 }
 
 require_root
-install_packages
-verify_php_mod
+install_base_packages
+install_github_cli
 info "Package installation step complete"
