@@ -38,7 +38,6 @@ main() {
     webroot="$TARGET_DIR/web"
   else
     warn "No html/ or web/ directory found under $TARGET_DIR. Apache will serve default page."
-    # Changed apache2 to httpd
     systemctl restart httpd
     return 0
   fi
@@ -57,8 +56,7 @@ main() {
 
   # DNF/RHEL httpd config path
   local apache_conf_dest="/etc/httpd/conf/httpd.conf"
-  
-  # Check for repo-provided httpd.conf or apache2.conf
+
   local repo_conf_src=""
   if [[ -f "$TARGET_DIR/httpd.conf" ]]; then
     repo_conf_src="$TARGET_DIR/httpd.conf"
@@ -73,7 +71,6 @@ main() {
     info "Symlinked Apache config to $repo_conf_src"
   fi
 
-  # Changed apache2 to httpd
   systemctl restart httpd
   systemctl enable httpd || true
   info "Apache (httpd) restarted and enabled"
