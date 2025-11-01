@@ -23,7 +23,6 @@ install_github_cli() {
   info "Installing GitHub CLI (gh)..."
 
   # Add the official GitHub CLI repository
-  # THIS IS THE FIX: The 'dnf config-manager' command is now guaranteed to work.
   if ! dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo; then
     err "Failed to add GitHub CLI repository"
     exit 1
@@ -35,22 +34,16 @@ install_github_cli() {
 
 install_base_packages() {
   info "Installing prerequisite: dnf-plugins-core (for config-manager)"
-  # THIS IS THE FIX: Install the dependency the script needs to run.
   dnf install -y dnf-plugins-core
 
   info "Enabling EPEL repository (for php-pecl-ssh2)"
-  # This is needed for RHEL/CentOS/Rocky/Alma, but is safe to run on Fedora
   dnf install -y epel-release || warn "Could not install epel-release. This is OK if on Fedora."
 
   info "Installing core packages (httpd, php, git, dialog)"
-  # Note: 
-  # - 'apache2' is 'httpd' on DNF-based systems.
-  # - 'libapache2-mod-php' is included in the 'php' package.
-  # - 'php-ssh2' is 'php-pecl-ssh2' (requires EPEL on RHEL-derivatives)
-  dnf install -y httpd php php-curl php-pecl-ssh2 git dialog curl gpg
+  # THIS IS THE FIX: Changed 'gpg' to 'gnupg2'
+  dnf install -y httpd php php-curl php-pecl-ssh2 git dialog curl gnupg2
 
   info "Enabling Apache (httpd) service"
-  # 'a2enmod' is not needed; installing 'php' enables it by default
   systemctl enable httpd || true
   systemctl restart httpd || true
 }
