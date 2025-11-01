@@ -1,0 +1,201 @@
+!Skills Exam Router R3 Error Config
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+!
+hostname R3
+!
+!
+logging buffered 16384
+enable secret cisco
+!
+aaa new-model
+!
+!
+aaa authentication login default local
+aaa authentication login CONSOLE none
+aaa authorization exec default local 
+!
+!
+clock timezone AEST +10
+clock summer-time AEDT recurring
+!do clock set 09:00:00 Jun 03 2016
+!
+!
+no ip domain lookup
+ip domain name tshoot.net
+!
+ip dhcp excluded-address 10.1.80.129 10.1.80.131
+!
+ip dhcp pool Simulatedv4LAN
+ network 10.1.80.128 255.255.255.128
+ default-router 10.1.80.129 
+!
+ipv6 unicast-routing
+!
+username cisco secret cisco
+!
+!
+ip telnet source-interface Loopback0
+ip ssh source-interface Loopback0
+ip ssh dh min size 2048
+!         
+!
+interface Loopback0
+ description Anchor
+ ip address 10.1.203.1 255.255.255.255
+ ip ospf network point-to-point
+ ipv6 enable
+ ipv6 address FE80::3 link-local
+ ipv6 address 2001:DB8:CAFE:203::1/128
+ ipv6 ospf 2 area 0
+ ipv6 ospf network point-to-point
+!
+interface Loopback1
+ description Branch Office Simulated LAN
+ ip address pool Simulatedv4LAN
+ ipv6 enable
+ ipv6 address FE80::3 link-local
+ ipv6 address 2001:DB8:CAFE:801::1/64
+!
+interface GigabitEthernet0/0/0
+ description Branch Office LAN
+ ip address 10.1.80.1 255.255.255.128
+ ip helper-address 10.1.2.13
+ ipv6 enable
+ ipv6 address FE80::1 link-local
+ ipv6 address 2001:DB8:CAFE:800::1/64
+ ipv6 nd prefix 2001:DB8:CAFE:800::/64 no-autoconfig
+ ipv6 nd managed-config-flag
+ ipv6 dhcp relay destination 2001:DB8:CAFE:213::D2
+ no shutdown
+!
+interface gigabitEthernet0/0/1
+ description FE to DLS1
+ no negotiation auto
+ duplex full
+ speed 1000
+ ip address 10.1.2.14 255.255.255.252
+ ipv6 enable
+ ipv6 address FE80::1 link-local
+ ipv6 address 2001:DB8:CAFE:212::3/64
+ no shutdown
+!
+interface Serial0/1/0
+ description WAN link to R1 - (Not used) 
+ no ip address
+ shutdown
+!
+interface Serial0/1/1
+ description WAN link to R2: (Not used) 
+ no ip address 
+ shutdown
+!
+router eigrp HQ
+ !        
+ address-family ipv4 unicast autonomous-system 1
+  !
+  af-interface default
+   shutdown
+   passive-interface
+  exit-af-interface
+  !
+  af-interface Loopback1
+   no shutdown
+  exit-af-interface
+  !
+  af-interface GigabitEthernet0/0/0
+   no shutdown
+  exit-af-interface
+  ! 
+  topology base
+  exit-af-topology
+  network 10.1.0.0 0.0.255.255
+ exit-address-family
+ !
+ address-family ipv6 unicast autonomous-system 1
+  !
+  af-interface default
+   shutdown
+   passive-interface
+  exit-af-interface
+  !
+  af-interface Loopback1
+   no shutdown
+  exit-af-interface
+  !
+  af-interface GigabitEthernet0/0/0
+   no shutdown
+  exit-af-interface
+  !
+  topology base
+  exit-af-topology
+ exit-address-family
+!
+!
+router ospf 1
+ router-id 3.0.0.3
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+ network 10.1.2.12 0.0.0.3 area 0
+ network 10.1.203.1 0.0.0.0 area 0
+!
+!
+ipv6 router ospf 2
+ router-id 33.0.0.33
+ redistribute eigrp 1 metric 100 metric-type 1 include-connected
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+!
+!
+crypto key gen rsa general-keys modulus 1024
+!
+ip http server
+ip http secure-server
+!
+!
+logging source-interface Loopback0
+logging host 10.1.100.1
+!
+!
+snmp-server community cisco RO
+snmp-server community san-fran RW
+snmp-server trap-source Loopback0
+snmp-server location TSHOOT Lab Facility
+snmp-server contact support@tshoot.net
+snmp-server enable traps eigrp
+snmp-server enable traps flash insertion
+snmp-server enable traps flash removal
+snmp-server enable traps config
+snmp-server enable traps cpu threshold
+snmp-server host 10.1.100.1 version 2c cisco 
+!
+!
+banner motd ^*** Skills Exam Router R3 Error Config Set A ***^
+!
+line con 0
+ exec-timeout 0 0
+ logging synchronous
+ login authentication CONSOLE
+!
+line vty 0 4
+ exec-timeout 0 0
+ logging synchronous
+ transport input telnet ssh
+!
+ntp source Loopback0
+ntp server 192.168.2.1
+!
+archive
+ log config
+  logging enable
+  logging size 50
+  notify syslog contenttype plaintext
+  hidekeys
+ path tftp://10.1.100.1/$h-archive-config
+ write-memory
+file prompt quiet
+!
+end
+!

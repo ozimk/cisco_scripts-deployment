@@ -1,0 +1,1169 @@
+#!/usr/bin/php
+<?php
+
+####################################################################################################
+# Load Cisco Paths                                                        #
+####################################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false) {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+    exit(1);
+}
+
+require_once("{$cisco_configs["lib_path"]}/routerconfig.php");
+require_once("{$cisco_configs["lib_path"]}/node.php");
+require_once("{$cisco_configs["lib_path"]}/upload_ini_generator.php");
+require_once("{$cisco_configs["lib_path"]}/route_map_file.php");
+
+
+##################################################################################
+# Router
+# This class decorates the Router Config Class to aid in keeping track of some 
+# some additional variables need for this script
+# o links_to_name: a list of the logic id mapped to the actual name of the physical interface or subinterface for each vrf.
+# o index: a unique index for the router instance
+# o $router_key: This actual name of the device e.g. Router 1
+###################################################################################
+class Router extends RouterConfig
+{
+    public $router_key, $index, $links_to_name, $used_DLCIs;
+
+    function __construct()
+    {
+        $this->links_to_name = [];
+        $this->used_DLCIs = [16];
+        parent::__construct();
+    }
+
+    function Router()
+    {
+        $this->links_to_name = [];
+        $this->used_DLCIs = [16];
+        parent::RouterConfig();
+    }
+}
+
+##################################################################################
+# ConstructVRFDefintions(vrf_name, vrf_num)
+# Constructs a VRFDefintion class with appropiate settings
+# o vrf_name: the name of the vrf
+###################################################################################
+function ConstructVRFDefintions($vrf_name)
+{
+    $vrf = new VRFDefinition();
+    $vrf->address_family = "ipv4";
+    $vrf->rds = [];
+    return $vrf;
+}
+
+##################################################################################
+# ConstructSyslog(syslog_settings)
+# Constructs a SyslogConfig class with appropiate settings
+# o syslog_settings: as per defined under a title in the tempalte ini file.
+###################################################################################
+function ConstructSyslog($syslog_settings)
+{
+    $syslog = new SyslogConfig();
+    $syslog->address = $syslog_settings["address"];
+    if (isset($syslog_settings["facility"])) {
+        $syslog->facility = $syslog_settings["facility"];
+    }
+    if (isset($syslog_settings["log_level"])) {
+        $syslog->log_level = $syslog_settings["log_level"];
+    }
+    if (isset($syslog_settings["source_interface"])) {
+        $syslog->source_interface = $syslog_settings["source_interface"];
+    }
+    if (isset($syslog_settings["transport_protocol"])) {
+        $syslog->transport_protocol = $syslog_settings["transport_protocol"];
+    }
+    if (isset($syslog_settings["port"])) {
+        $syslog->port = $syslog_settings["port"];
+    }
+
+    return $syslog;
+}
+
+function ConstructSNMP($snmp_settings, $room, $rack, $kit)
+{
+    $snmp = new SNMPConfig();
+    // $host, $port, $view, $group, $user, $permission, $authpass, $encpass, $location, $contact, $traps, $ifindex_persist, $options;
+    $snmp->view = $snmp_settings["view"];
+    $snmp->group = $snmp_settings["group"];
+    $snmp->user = $snmp_settings["user"];
+    $snmp->authpass = $snmp_settings["auth"];
+    $snmp->encpass = $snmp_settings["enc"];
+    $snmp->permission = $snmp_settings["permission"];
+
+    $snmp->location = "$room-$rack-$kit"; // can't get the router name here it is done in build router.
+    $snmp->traps = $snmp_settings["traps"];
+    $snmp->ifindex_persist = $snmp_settings["ifindex"];
+
+    $snmp->options = explode("#", $snmp_settings['options']);
+
+    $snmp->host = $snmp_settings["host"];
+    $snmp->transport = $snmp_settings["transport"];
+    $snmp->port = $snmp_settings["port"];
+
+    return $snmp;
+}
+
+##################################################################################
+# ConstructNTP(ntp_settings)
+# Constructs a NTPConfig class with appropiate settings
+# o ntp_settings: as per defined under a title in the tempalte ini file.
+###################################################################################
+function ConstructNTP($ntp_settings)
+{
+    $ntp = new NTPConfig();
+    $ntp->server_address = $ntp_settings["server"];
+    return $ntp;
+}
+##################################################################################
+# ParseKeyowd(&line, interfaces, networks)
+# A helper function to parse keywords used in the line of ACLs, Route Maps and Prefix lists
+# o line: a reference to the line being modified
+# o interfaces: the list of interfaces for the current set of models indexed by model and link number
+# o networks: a list of network addresses for the current set of models.
+###################################################################################
+function ParseKeyword(&$line, $current_model_id, $interfaces, $networks, $routing_protocols)
+{
+    if (preg_match_all("/\{([a-zA-Z]|\-||\+|[0-9])+\}/", $line, $matches)) {
+        foreach ($matches[0] as $match) {
+            $keyword = trim($match, "{}");
+            if (preg_match("/interface-network/", $match)) {
+                $num = explode("-", $keyword)[3];
+                $model_id = explode("-", $keyword)[2];
+                if (!isset($interfaces[$model_id][$num])) {
+                    return false;
+                }
+                $line = str_replace($match, "{$interfaces[$model_id][$num]->get_network()}", $line);
+            } else if (preg_match("/interface-mask/", $match)) {
+                $num = explode("-", $keyword)[3];
+                $model_id = explode("-", $keyword)[2];
+                if (!isset($interfaces[$model_id][$num])) {
+                    return false;
+                }
+                $line = str_replace($match, "{$interfaces[$model_id][$num]->mask}", $line);
+            } else if (preg_match("/interface-slash/", $match)) {
+                $num = explode("-", $keyword)[3];
+                $model_id = explode("-", $keyword)[2];
+                if (!isset($interfaces[$model_id][$num])) {
+                    return false;
+                }
+                $line = str_replace($match, "{$interfaces[$model_id][$num]->get_slash_mask()}", $line);
+            } else if (preg_match("/interface-wildcard/", $match)) {
+                $num = explode("-", $keyword)[3];
+                $model_id = explode("-", $keyword)[2];
+                if (!isset($interfaces[$model_id][$num])) {
+                    return false;
+                }
+                $line = str_replace($match, "{$interfaces[$model_id][$num]->get_wildcard()}", $line);
+            } else if (preg_match("/interface-id/", $match)) {
+                // implemented in build router
+            } else if (preg_match("/interface-address/", $match)) {
+                $num = explode("-", $keyword)[3];
+                $model_id = explode("-", $keyword)[2];
+                $line = str_replace($match, "{$interfaces[$model_id][$num]->address}", $line);
+            } else if (preg_match("/network/", $match)) {
+                $num = explode("-", $keyword)[1];
+                $line = str_replace($match, "{$networks[$num]}", $line);
+            } else if (preg_match("/bgp-as-local/", $match)) {
+                $adjust = substr($keyword, -1);
+                $add = substr($keyword, -2,-1) === '+';
+                if(!is_numeric($adjust)) { $adjust = 0; }
+                if(!$add) {$adjust = $adjust * -1;}
+                if (!isset($routing_protocols[$current_model_id]["bgp"])) {
+                    return false;
+                }            
+                $as_number = $routing_protocols[$current_model_id]['bgp'][0]->as_number + $adjust;
+                $line = str_replace($match, "{$as_number}", $line);
+            }
+        }
+    }
+}
+##################################################################################
+# Construct ACL RouteMap Prefix lIst
+# Constructs a simple data structure holding details of the repesctive commands and a list of text that defines rules
+###################################################################################
+function ConstructACLText($acl_name, $acl_settings, $model_id, $interfaces, $networks, $routing_protocols)
+{
+    $acl = new ACLText();
+    $acl->name = $acl_name;
+    $acl->extended = $acl_settings["extended"];
+    $acl->ParseFromText($acl_settings['rules'], "#");
+    for ($i = 0; $i < count($acl->statements); $i++) {
+        // if it contains invalid lines should not have the acl
+        if (ParseKeyword($acl->statements[$i], $model_id, $interfaces, $networks, $routing_protocols) === false) {
+            echo "WARNING the access list $acl_name had an instance removed due to incompatible lines - this is most likley ocurring due to a line that requires an interface that doe not exist on the first or last set of sub-topologies, in which case this warning can be ignored.";
+            return null;
+        }
+    }
+
+    foreach ($acl_settings['Attached'] as $attached) {
+        $link_dir = explode("-", $attached);
+        $link = intval($link_dir[0]);
+        if (isset($interfaces[$model_id][$link])) {
+            if ($link_dir[1] == "out") {
+                $interfaces[$model_id][$link]->acl_out = $acl_name;
+            } else {
+                $interfaces[$model_id][$link]->acl_in = $acl_name;
+            }
+        }
+    }
+
+    return $acl;
+}
+
+function ConstructPrefixText($prefix_name, $prefix_settings, $model_id, $interfaces, $networks, $routing_protocols)
+{
+    $prefix = new PrefixText();
+    $prefix->name = $prefix_name;
+    $prefix->ParseFromText($prefix_settings['rules'], "#");
+    for ($i = 0; $i < count($prefix->statements); $i++) {
+        if (ParseKeyword($prefix->statements[$i], $model_id, $interfaces, $networks, $routing_protocols) === false) {
+            echo "WARNING the prefix list $prefix_name had an instance removed due to incompatible lines - this is most likley ocurring due to a line that requires an interface that doe not exist on the first or last set of sub-topologies, in which case this warning can be ignored.";
+            return null;
+        }
+    }
+    return $prefix;
+}
+
+function ConstructRouteMapText($routemap_name, $routemap_settings, $model_id, $topology, $template, $routing_protocols, $interfaces, $networks, $rooms_indexed, $index)
+{
+    $routemap = new RouteMapText();
+    $routemap->name = $routemap_name;
+    $routemap->permit = $routemap_settings["permit"];
+    $routemap->number = $routemap_settings["number"];
+    $routemap->ParseFromText($routemap_settings['statements'], "#");
+
+    for ($i = 0; $i < count($routemap->statements); $i++) {
+        if (ParseKeyword($routemap->statements[$i], $model_id, $interfaces, $networks, $routing_protocols) === false) {
+            echo "WARNING the routemap list $routemap_name had an instance removed due to incompatible lines - this is most likley ocurring due to a line that requires an interface that doe not exist on the first or last set of sub-topologies, in which case this warning can be ignored.";
+            return null;
+        }
+    }
+
+    if (isset($routing_protocols[$model_id]["bgp"])) {
+        // get bgp, there should only be one bgp protocol per model
+        $bgp_protocol = $routing_protocols["bgp"][0];
+        $bgp_settings = $template[array_filter($template[$model_id]["Routing"], function ($value) use ($template) {
+            return $template[$value]["protocol"] == "bgp";
+        })[0]]; // this will get the bgp named settings for the current model
+
+        foreach ($routemap_settings["Attached"] as $attached) {
+            $parts = explode("-", $attached);
+            if (isset($interfaces[$model_id][$parts[0]])) {
+                $result = $topology[$model_id]->GetConnection($parts[0]);
+                $details = explode("-", $topology[$model_id]->GetInterfaceType($parts[0]));
+                $nei = null;
+                if ($details[0] != "ex") {
+                    // internal neighbor might use update source
+                    $nei_address = $interfaces[$result["node"]->id][$result["interface_id"]]->address;
+                    $nei = null;
+                    if (isset($bgp_protocol->bgp_neighbors[$nei_address])) {
+                        $nei = $bgp_protocol->bgp_neighbors[$nei_address];
+                    } else { // if it isn't set that must mean these naibours are using update source (the reason we don't check the update source setting direclty as the if statement is becuase that setting isn't always applied to every neighbor)
+                        $nei_address = $interfaces[$result["node"]->id][$bgp_settings["update_source"]]->address;
+                        $nei = $bgp_protocol->bgp_neighbors[$nei_address];
+                    }
+                } else if ($details[1] == "f") {
+                    // use the empty neighbor created 
+                    $predicted_address = long2ip(ip2long($interfaces[$model_id][$parts[0]]->address) + 1);
+                    $nei = $bgp_protocol->bgp_neighbors[$predicted_address];
+                } else if ($details[1] == "b") {
+                    $found_router = false;
+                    list($other_router, $other_model_id, $other_link) = GetPreviousRouter($details[2], $model_id, $parts[0], $topology, $rooms_indexed, $index, $found_router);
+                    if ($found_router) {
+                        $nei_address = $other_router->interfaces[$other_router->links_to_name[$topology[$model_id]->vrf_name][$other_link]]->address;
+                        $nei = $bgp_protocol->bgp_neighbors[$nei_address];
+                    }
+                }
+
+                if ($nei != null) {
+                    if ($parts[1] == "out") {
+                        $nei->route_map_out = $routemap->name;
+                    } else {
+                        $nei->route_map_in = $routemap->name;
+                    }
+                }
+            }
+        }
+    }
+
+    return $routemap;
+}
+
+function ConstructAbitraryText($config_settings, $model_id, $interfaces, $networks, $routing_protocols)
+{
+    $arbitrary = new ArbitraryText();
+    $arbitrary->ParseFromText($config_settings['arbitrary'], "#");
+    for ($i = 0; $i < count($arbitrary->statements); $i++) {
+        if (ParseKeyword($arbitrary->statements[$i],  $model_id, $interfaces, $networks, $routing_protocols) === false) {
+            return null;
+        }
+    }
+    return $arbitrary;
+}
+
+##################################################################################
+# ConstructRoutingProtocols($template, $interfaces, $topology, $physical, $rooms_indexed, $index, &$network_details)
+# Constructs A list of RoutingConfigs indexed by Model name and protocol_name. 
+# (Note ther can be multiple of the same protocol thus the list of Routing COnfigs holds a list of each protocol)
+# o template: the template ini file
+# o interfaces: a list of interfaces indexed by model_name and link number
+# o topology: a list of nodes indexed by model name
+# o physical: the physical ini file that maps link number ot interface name
+# o rooms_indexed: a list of previously constructed indexed router classes
+# o index: the index of the first model in the topology
+###################################################################################
+function ConstructRoutingProtocol($template, $interfaces, $topology, $physical, $rooms_indexed, $index, &$network_details)
+{
+    $protocols = [];
+
+    foreach ($topology as $model_id => $model) {
+        $protocols[$model_id] = [];
+        if (!isset($template[$model_id]["Routing"])) {
+            continue;
+        }
+        foreach ($template[$model_id]["Routing"] as $routing_title) {
+            $protocol_name = $template[$routing_title]["protocol"];
+
+            $protocol = new RoutingProtocol();
+            $protocol->router_id = $network_details[$routing_title]["router_id"] = long2ip(ip2long($network_details[$routing_title]["router_id"]) + 1);
+            $advertised_networks = [];
+            $protocols[$model_id][$protocol_name] = []; # This is becuase we may have multiple instances of the same routing protocol on the same device
+
+            if ($protocol_name == "bgp") // BGP Protocol Construction
+            {
+                $protocol->as_number = $network_details[$routing_title]["as"];
+                if (isset($network_details[$routing_title]["advertise_ibgp"])) {
+                    $protocol->bgp_no_sync = true;
+                }
+                if (in_array($model_id, explode(",", trim($network_details[$routing_title]["increment_as_after"])))) {
+                    $network_details[$routing_title]["as"]++;
+                }
+
+                //Construct Neibours
+                $directly_connected = !isset($network_details[$routing_title]["update_source"]); //if an alternate update source is not provided then it is assumed the neighbor must be at address of directly connected interface.
+                $protocol->bgp_neighbors = [];
+
+                # Go through each interface to find connected bgp instances on other nodes that should be neighbours
+                foreach ($interfaces[$model_id] as $my_interface => $my_net_interface) {
+                    $other_model = $topology[$model_id]->GetAdjacentNode($my_interface);
+
+                    if (!in_array($routing_title, $template[$other_model->id]["Routing"])) {
+                        continue;
+                    } // The connected model does not run this instnace of bgp so should not be made a neighbor
+
+                    $details = explode("-", $topology[$model_id]->GetInterfaceType($my_interface));
+
+                    if ($details[0] != "ex") { // Handle the neighbor creations of neibours wihtin the toplogy
+                        $result = $model->GetConnection($my_interface);
+                        $other_id = $result["node"]->id;
+                        if ($other_id == $model_id || !isset($protocols[$other_id])) {
+                            continue;
+                        } //this is this model or the protocol for the model is not yet created so ignore
+                        //Neighbor to Other Model is this model
+                        $me = new Neighbor();
+                        $me->remote_as = $protocol->as_number;
+                        //This Model's Neighbor is the other model
+                        $nei = new Neighbor();
+                        $nei->remote_as = $protocols[$other_id][$protocol_name][0]->as_number;
+
+                        if ($me->remote_as == $nei->remote_as) { //set configs for IBGP
+                            $nei->next_hop_self = true;
+                            $me->next_hop_self = true;
+                            // Advertise all networks in AS
+                            foreach ($interfaces[$other_id] as $name => $net_interface) {
+                                if (in_array($name, $network_details[$routing_title]["Advertised"])) {
+                                    $advertised_networks[$net_interface->get_network()] = $net_interface->mask;
+                                }
+                            }
+                            foreach ($interfaces[$model_id] as $name => $net_interface) {
+                                if (in_array($name, $network_details[$routing_title]["Advertised"])) {
+                                    # These networks for the current model need to be dvertised in the other in ibgp, so adding these to that network
+                                    $protocols[$other_id][$protocol_name][0]->networks[$net_interface->get_network()] = $net_interface->mask;
+                                }
+                            }
+                            // update source will be limited to ibgp as it requires another routing protocol to carry the loopback address destination
+                            if ($directly_connected) { //if direclty connected use the link
+                                $connected_interface = $result["interface_id"];
+                                $nei_address = $interfaces[$other_id][$connected_interface]->address;
+                                $my_address = $my_net_interface->address;
+                            } else {
+                                $update_source_link = $network_details[$routing_title]["update_source"];
+                                $nei_address = $interfaces[$other_id][$update_source_link]->address;
+                                $my_address = $interfaces[$model_id][$update_source_link]->address;
+                                $nei->update_source = $update_source_link;
+                                $me->update_source = $update_source_link;
+                            }
+                        } else { // Not IBGP but still within the subtopology, so directly connected address.
+                            $connected_interface = $result["interface_id"];
+                            $nei_address = $interfaces[$other_id][$connected_interface]->address;
+                            $my_address = $my_net_interface->address;
+                        }
+
+                        // Add Neigbour to this protocol and the other models protocol
+                        $protocol->bgp_neighbors[$nei_address] = $nei;
+                        $protocols[$other_id][$protocol_name][count($protocols[$model_id][$protocol_name])]->bgp_neighbors[$my_address] = $me;
+                    } else if ($details[1] == "b") { // Handle neigbors across topology
+                        $found_router = false;
+                        list($other_router, $other_model_id, $other_link) = GetPreviousRouter($details[2], $model_id, $my_interface, $topology, $rooms_indexed, $index, $found_router);
+                        if ($found_router) {
+                            $nei = new Neighbor();
+
+                            //$connected_interface = $result["interface_id"];
+                            $nei_address = $other_router->interfaces[$other_router->links_to_name[$topology[$model_id]->vrf_name][$other_link]]->address;
+
+                            $as_number = 0;
+
+                            foreach ($other_router->routing_itp["bgp"] as $bgp_protocol) { #search the other routing protocols in the other router for the correct bgp instance in the correct vrf instance
+                                if (strtolower($bgp_protocol->vrf_name) == strtolower($topology[$model_id]->vrf_name)) {
+                                    $my_predicted_address = long2ip(ip2long($nei_address) + 1); // prediction from the forward direction
+                                    $me = $bgp_protocol->bgp_neighbors[$my_predicted_address];
+                                    $my_address = $my_net_interface->address;
+                                    if ($my_address != $my_predicted_address) {
+                                        unset($bgp_protocol->bgp_neighbors[$my_predicted_address]);
+                                    }
+                                    $me->remote_as = $protocol->as_number;
+                                    $bgp_protocol->bgp_neighbors[$my_address] = $me;  // Add This Router as Neighbor to Previous Router
+
+                                    $as_number = $bgp_protocol->as_number; // get previous routers as number
+                                    break; //can break becuase there should only ever be one bgp process per vrf
+                                }
+                            }
+
+                            // Add  Previous Router as Neighbor
+                            $nei->remote_as = $as_number;
+                            $protocol->bgp_neighbors[$nei_address] = $nei;
+                        }
+                    } else if ($details[1] == "f") { // createing an empty neighbor so that it can be used if needed.( for example to apply routemaps) We must predict the address which will get fixed on the backward way if it is wrong
+                        $nei = new Neighbor();
+                        $predicted_nei_address = long2ip(ip2long($my_net_interface->address) + 1);
+                        $protocol->bgp_neighbors[$predicted_nei_address] = $nei;
+                    }
+                }
+            } else if ($protocol_name == "ospf") { //OSPF Protocol Construction
+                $protocol->proc_id = $template[$routing_title]["proc_id"];
+                $ospf_loopbacks = $model->GetLoopbacks($model_id);
+            }
+
+            //advertise directly connected networks            
+            foreach ($interfaces[$model_id] as $name => $net_interface) {
+                if (in_array($name, $network_details[$routing_title]["Advertised"])) {
+                    # wiht bgp key is network address and value is mask, with others key is interface name, with ospf value is area and with others value is null - note only area 0 for ospf
+                    $advertised_networks[$protocol_name == "bgp" ? $net_interface->get_network() : $name] = $protocol_name == "ospf" ? 0 : ($protocol_name == "bgp" ? $net_interface->mask : null);
+                    if ($protocol_name == "ospf" && in_array($name, $ospf_loopbacks)) {
+                        $net_interface->loopback_ospf_good = true;
+                    }
+                }
+            }
+            $protocol->networks = $advertised_networks;
+            array_push($protocols[$model_id][$protocol_name], $protocol);
+        }
+    }
+    return $protocols;
+}
+
+####################################################################################################
+# ConstructNetInterface Configs
+# Gives each interface an ip address in the specified netowrk
+# o networks: a list of network addresses
+# o network_masks = alist of  masks in cidr indexed by type e.g. 24, 31 etc or ex (external)
+# o index the first index in the topology set
+####################################################################################################
+
+function ConstructNetInterface(&$networks, $network_masks, $rooms_indexed, $index, $topology, $replication, $physical)
+{
+    //  var_dump($topology);
+    $interfaces = [];
+    $types = [];
+    asort($network_masks); //ensures network sizes are in order and thus proper vlsm occurs
+    foreach ($topology as $id => $node) { // sorting the interfaces of each model by type
+        $interfaces[$id] = [];
+        foreach ($node->GetAllInterfaceIDs() as $interface_id) {
+            $type = $node->GetInterfaceType($interface_id);
+            $typeparts = explode("-", $type);
+            $type = $typeparts[0];
+            if (!isset($types[$type])) {
+                $types[$type] = [];
+            }
+            if (!isset($types[$type][$node->id])) {
+                $types[$type][$node->id] = [];
+            }
+            array_push($types[$type][$node->id], $interface_id);
+        }
+    }
+
+
+    $networksaslong = []; //used to later grow network by correct amount for next replicaiton
+    $bigmasks = []; //used for trakcign the biggest mask for each netowrk set to deterimine how to incrment at end
+    for ($n = 0; $n < count($networks); $n++) {
+        $networksaslong[$n] = ip2long($networks[$n]);
+        $bigmasks[$n] = 32;
+    }
+    $ipsaslong = $networksaslong;
+
+    foreach ($network_masks as $type => $mask) { //iterate through each mask in order form bigest to smallest
+        if ($type == "ex") {
+            continue;
+        } // external connections are handled later
+        foreach ($types[$type] as $node_id => $interface_ids) {
+            foreach ($interface_ids as $interface_id) {
+                $network_id = $topology[$node_id]->GetInterfaceNetwork($interface_id);
+                $ipaslong = $ipsaslong[$network_id];
+
+                if (!isset($interfaces[$node_id][$interface_id])) { //check if this has not already been assigned an ip
+                    $ip = $mask == 31 ? long2ip($ipaslong) : ($mask == 32 ? long2ip($ipaslong) : long2ip($ipaslong + 1)); //accoutn for netowrk address unless point to point
+                    $other = $topology[$node_id]->GetConnection($interface_id);
+                    $interfaces[$other["node"]->id][$other["interface_id"]] = $mask == 31 ? long2ip($ipaslong + 1) : ($mask == 32 ? long2ip($ipaslong) : long2ip($ipaslong + 2)); // assign its connection the next ip to ensure it is the same subnet
+                } else {
+                    $ip = $interfaces[$node_id][$interface_id];
+                }
+
+                $interface = new NetInterface();
+                $interface->address = $ip;
+                $interface->mask = long2ip(4294967296 - pow(2, 32 - $mask));
+                $interface->shutdown = false;
+                $interfaces[$node_id][$interface_id] = $interface;
+                $ipsaslong[$network_id] += pow(2, 32 - $mask);
+                if ($mask < $bigmasks[$network_id]) {
+                    $bigmasks[$network_id] = $mask;
+                }
+            }
+        }
+    }
+    //Handle the External Interfaces
+    $mask = $network_masks["ex"];
+    foreach ($types["ex"] as $node_id => $interface_ids) {
+        foreach ($interface_ids as $interface_id) {
+            $typeparts = explode("-", $topology[$node_id]->GetInterfaceType($interface_id));
+            $dir = $typeparts[1];
+            if ($dir == "b") {
+                $steps_back = $typeparts[2];
+                $found_router = false;
+                list($other_router, $other_router_model, $other_router_link) = GetPreviousRouter($steps_back, $node_id, $interface_id, $topology, $rooms_indexed, $index, $found_router);
+                if ($found_router && isset($physical[$other_router->router_key]["Interfaces"][$other_router_link])) {
+                    $interface = new NetInterface();
+                    $interface->address = long2ip(ip2long($other_router->interfaces[$other_router->links_to_name[$topology[$node_id]->vrf_name][$other_router_link]]->address) + 1);
+                    $interface->mask = long2ip(4294967296 - pow(2, 32 - $mask));
+                    $interface->shutdown = false;
+                    $interfaces[$node_id][$interface_id] = $interface;
+                }
+            } else if ($dir == "f") {
+                $network_id = $topology[$node_id]->GetInterfaceNetwork($interface_id);
+                $ipaslong = $ipsaslong[$network_id];
+                $interface = new NetInterface();
+                $interface->address = $mask == 31 ? long2ip($ipaslong) : long2ip($ipaslong + 1);
+                $interface->mask = long2ip(4294967296 - pow(2, 32 - $mask));;
+                $interface->shutdown = false;
+                $interfaces[$node_id][$interface_id] = $interface;
+                $ipsaslong[$network_id] += pow(2, 32 - $mask);
+            }
+        }
+    }
+
+    //find next incrment tp create a posisble summary route for the topology
+    for ($n = 0; $n < count($networks); $n++) {
+        while ($networksaslong[$n] < $ipsaslong[$n]) {
+            $networksaslong[$n] += pow(2, 32 - ($bigmasks[$n] - 1));
+        }
+        $networks[$n] = long2ip($networksaslong[$n]);
+    }
+    return $interfaces;
+}
+
+
+
+####################################################################################################
+# ConstructComponents
+# Create on the config classes indexed by model
+# - interfaces, routing_protocols, components
+# o room_indexed - an array that holds refereces to the router but is indexed with integers, the index is based on the index of the colour in the replicaiotn .ini      
+# o $index, the current index of the first router in the network in the room_indexed array
+####################################################################################################
+function ConstructComponents($rooms_indexed, $index, $template, $replication, $physical, $topology, &$network_details, $room_key, $rack_key, $kit_key)
+{
+    $starting_network = $network_details["Networks"];
+
+    $interfaces = ConstructNetInterface($network_details["Networks"], $template["Masks"], $rooms_indexed, $index, $topology, $replication, $physical);
+    $routing_protocols = ConstructRoutingProtocol($template, $interfaces, $topology, $physical, $rooms_indexed, $index, $network_details);
+
+
+    $components = [];
+    foreach ($topology as $model_id => $model) { //components are configs that are not dependant on the configuration of other routers or can be configured on a per model basis rather than holistically for the topology
+        $components[$model_id] = [];
+        if (!isset($template[$model_id]["Components"])) {
+            continue;
+        }
+        foreach ($template[$model_id]["Components"] as $component_title) {
+            $config = $template[$component_title]["config"];
+            $room = $template[$component_title]["room"];
+            $rack = $template[$component_title]["rack"];
+            $kit = $template[$component_title]["kit"];
+
+            //If the config is to be excluded based on the container
+            if ($room != "All" && !in_array($room_key, explode(",", $room))) {
+                continue;
+            }
+            if ($rack != "All" && !in_array($rack_key, explode(",", $rack))) {
+                continue;
+            }
+            if ($kit != "All" && !in_array($kit_key, explode(",", $kit))) {
+                continue;
+            }
+
+            $component = null;
+            if (!isset($components[$model_id][$config])) {
+                $components[$model_id][$config] = [];
+            }
+
+            switch ($config) {
+                case "syslog":
+                    $component = ConstructSyslog($template[$component_title]);
+                    break;
+                case "snmp":
+                    $component = ConstructSNMP($template[$component_title], $room_key, $rack_key, $kit_key);
+                    break;
+                case "acl":
+                    $component = ConstructACLText($component_title, $template[$component_title], $model_id, $interfaces, $starting_network, $routing_protocols);
+                    break;
+                case "prefix":
+                    $component = ConstructPrefixText($component_title, $template[$component_title], $model_id, $interfaces, $starting_network, $routing_protocols);
+                    break;
+                case "route_map":
+                    $component = ConstructRouteMapText($component_title, $template[$component_title], $model_id, $topology, $template, $routing_protocols, $interfaces, $starting_network, $rooms_indexed, $index);
+                    break;
+                case "ntp":
+                    $component = ConstructNTP($template[$component_title]);
+                    break;
+                case "arbitrary":
+                    $component = ConstructAbitraryText($template[$component_title], $model_id, $interfaces, $starting_network, $routing_protocols);
+                    break;
+            }
+
+            if ($component != null) {
+                array_push($components[$model_id][$config], $component);
+            }
+        }
+    }
+    return array($interfaces, $routing_protocols, $components);
+}
+
+
+#-------------------------------------------------- PostConstruction Checks and Settings -------------------------------------#
+
+###################################################################################
+# CheckListDependancies()
+# check that acl/prefix/routemaps that dpend on other lists exiting
+# o $list the list to be checked
+# o $dependancies a list of components that should contain thedependancies for the list
+
+function CheckListDependancies($list, $dependancies)
+{
+    foreach ($list->statements as &$line) {
+        if (preg_match("/{list-([a-zA-Z]|\-|_|[0-9])+}/", $line, $matches)) {
+
+            $name = join("", array_slice(str_split($matches[0]), 6, -1));
+            $depends = array_filter($dependancies, function ($value) use ($name) {
+                return $value->name == $name;
+            });
+            if (count($depends) == 0) {
+                return false;
+            }
+            $line = str_replace($matches[0], $name, $line);
+            foreach ($depends as $depend) {
+                if (!CheckListDependancies($depend, $dependancies)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+function ResolveInterfaceID($list, $vrf_links_to_name) {
+    foreach ($list->statements as &$line) {
+        if (preg_match_all("/\{([a-zA-Z]|\-|[0-9])+\}/", $line, $matches)) {
+            foreach ($matches[0] as $match) {
+                $keyword = trim($match, "{}");
+                if (preg_match("/interface-id-([0-9]+)/", $line, $keyword)) {
+                    $num = explode("-", $keyword[0])[2];
+                    if(isset($vrf_links_to_name[intval($num)])) {
+                        $line = str_replace($match, "{$vrf_links_to_name[$num]}", $line);
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+##################################################################################
+# CheckInterfaceOnVRF(this_vrf_name, router_key, link, vrfs, templates, topologies)
+# This will if the link is used by more than one vrf on the same router, returning true.
+# o this_vrf_name: the vrf that this link is known to exist on.
+# o router_key: ROuter 1 etc
+# o link: the logical number for the link being checked
+# o vrfs: a list of the vrf names
+# o templates: the templates ini file indexed by vrf_name
+# o topologies: a list of topolgies indexed by vrf_name and model_name
+###################################################################################
+function CheckInterfaceOnVRF($this_vrf_name, $router_key, $link, $vrfs, $templates, $topologies)
+{
+    foreach ($vrfs as $vrf_name) {
+        if ($vrf_name == $this_vrf_name) {
+            continue;
+        }
+        $mappings = $templates[$vrf_name]["Mappings"];
+        $model_name = $mappings[$router_key];
+        if ($topologies[$vrf_name][$model_name]->HasInterfaceID($link)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+###########################################################
+# EncapsulateInterface()
+# Creates and sets the encpsulation protocol of the parent interface
+# o $interface_name: the physical name of the parent interface
+# o $net_interface: the interface that is to be a subinterface that has resulted in the need for a parent interface
+# o unqiue_interface_num: a unique number for the interface within the router
+# o subconstant: if the interface was already a subinterface include this is the subinterface name after the .
+# o create_parent: true if you want a new parent interface
+#########################################################
+function EncapsulateInterface($router, $interface_name, &$net_interface, $vrf_num, $subconstant, $next_hop, $create_parent)
+{
+    if (strtolower($interface_name[0]) == "s") { //if its serial use frame-relay with dlci mapping
+
+        $net_interface->fr_subint_type = "point-to-point";
+        $net_interface->fr_encapsulation = "ietf";
+        $net_interface->fr_mapIP = $next_hop;
+        // fr_mapDLCI is not done here, becuase of the strict requirements on matching and unique values.
+
+        if ($create_parent) {
+            $parent_interface = new NetInterface();
+            $parent_interface->encapsulation = "frame-relay";
+            $parent_interface->fr_encapsulation = "ietf";
+            $parent_interface->fr_nokeepalive = true;
+            $parent_interface->fr_noinversearp = true;
+            return $parent_interface;
+        }
+    }
+
+    if (strtolower($interface_name[0]) == "g" || strtolower($interface_name[0]) == "f") //if it giga or fast use dot1Q
+    {
+        $net_interface->encapsulation = "dot1Q";
+        $net_interface->vlan_id = 10 * $subconstant + $vrf_num;
+        if ($create_parent) {
+            $parent_interface = new NetInterface();
+            return $parent_interface;
+        }
+    }
+}
+
+#####################################################################################################
+# GetPreviousRouter
+# This provides the ability to get routers that have already been cosntucted as part of a previous topology set.
+# o topology_steps_back: how many topology sets to go back to look for the previous router, effectivley allowing for searching furhter than the most adjacent topology set.
+# o index_of_first_in_netowrk the index of the first model in the topology set as found in rooms_indexed
+###################################################################################################################
+function GetPreviousRouter($topology_steps_back, $off_model_id, $off_interface_id, $topology, $rooms_indexed, $index_of_first_in_network, &$found_router)
+{
+    $result = $topology[$off_model_id]->GetConnection($off_interface_id);
+    $i = 0;
+    $found_router = false;
+    $other_router = null;
+    foreach ($topology as $model_name => $node) {
+        $before_index = $index_of_first_in_network - (count($topology) * $topology_steps_back) + $i;
+        if ($model_name == $result["node"]->id && isset($rooms_indexed[$before_index])) {
+            $other_router = $rooms_indexed[$before_index];
+            $found_router = true;
+            break;
+        }
+        $i++;
+    }
+
+    return array($other_router, $result["node"]->id, $result["interface_id"]);
+}
+
+####################################################################################################
+# BuildROuter
+# Create a single router class and attahces all the configs to it.
+# This will also handle tranlating many fo the logical names based on models into the correct physical names based on the router
+# Also handles configuratuion modification to account for vrfs
+# it will remove some ocnfigurations made to non-existent physical links, these pahantom links may occur if one has made a model map to routers where the directions are not all the same.
+# this happens when using 1 model for router in a grid. a router will either have a direction 'up' or a direction 'down' but not both, hoewver the model woud specify both up and down directions
+# so just use the model ystem properly and create 2 model in  that case
+####################################################################################################
+function BuildRouter($router_key, $rooms_indexed, $index, $physical, $templates, $topologies, $vrfs, $interfaces, $routing_protocols, $components)
+{
+    $router = new Router();
+    $router->router_key = $router_key;
+    $router->index = $index;
+    $hostname_num = $router->index + 1;
+    $router->hostname = "Router$hostname_num";
+
+    for ($v = 0; $v < count($vrfs); $v++) {
+        $vrf_num = $v + 1;
+        $vrf_name = $vrfs[$v];
+        $mappings = $templates[$vrf_name]["Mappings"];
+        $model_name = $mappings[$router_key];
+
+        // attach VRF Defintions
+        if (strtolower($vrf_name) != "global") {
+            $router->vrfs[$vrf_name] = ConstructVRFDefintions($vrf_name);
+        }
+        $router->links_to_name[$vrf_name] = [];
+
+        //Attach Interfaces
+        foreach ($interfaces[$vrf_name][$model_name] as $link => $net_interface) {
+            if (!isset($physical[$router_key]["Interfaces"][$link])) {
+                continue;
+            } //Check if its physically there otherwise ignore it.
+            $interface_name = $physical[$router_key]["Interfaces"][$link]; // translate logical name to physical name
+
+            if (CheckInterfaceOnVRF($vrf_name, $router_key, $link, $vrfs, $templates, $topologies)) { //if the interface is used by mutiple vrfs we must modify the interface
+                $details = explode("-", $topologies[$vrf_name][$model_name]->GetInterfaceType($link));
+
+                // Here we must consider for the case that the subinterface will be using frame relay. Thus we must get the next hop address
+                if ($details[0] == "ex") {
+                    if ($details[1] == "b") {
+                        $first_index_of_net = $index - ($index % count($topologies[$vrf_name]));
+                        $found_router = false;
+                        list($other_router, $other_model, $other_link) = GetPreviousRouter(intval($details[2]), $model_name, $link, $topologies[$vrf_name], $rooms_indexed, $first_index_of_net, $found_router);
+                        if ($found_router) {
+                            $other_net_interface = &$other_router->interfaces[$other_router->links_to_name[$vrf_name][$other_link]];
+                            $next_hop = $other_net_interface->address;
+                            if (isset($other_net_interface->fr_mapDLCI)) { // the previous router would not have been able to find the next hop so we must set it now
+                                $other_net_interface->fr_mapIP = $net_interface->address;
+                                $net_interface->fr_mapDLCI = $other_net_interface->fr_mapDLCI;
+                                array_push($router->used_DLCIs, $net_interface->fr_mapDLCI);
+                            }
+                        }
+                    } else {
+                        $next_hop = 0; // the next router has not been built yet so no need to worry about next hop it will be set when this router is the previous router of anotherr
+                    }
+                } else {
+                    $result = $topologies[$vrf_name][$model_name]->GetConnection($link);
+                    $next_hop = $interfaces[$vrf_name][$result["node"]->id][$result["interface_id"]]->address;
+                    $net_interface->fr_mapDLCI = $interfaces[$vrf_name][$result["node"]->id][$result["interface_id"]]->fr_mapDLCI;
+                    array_push($router->used_DLCIs, $net_interface->fr_mapDLCI);
+                }
+
+                //Check if the interface is already a subinterface dictated by the user.
+                $subconstant = 0;
+                $subinterface = explode(".", $interface_name);
+                if (count($subinterface) == 2) {
+                    $subconstant = intval($subinterface[1]);
+                    $interface_name = $subinterface[0];
+                }
+
+                //Here we will encpaulate the interface to A subinterface. If the parent interface does not existo n the router yet we will also create it.
+                if (!isset($router->interfaces[$interface_name])) {
+                    $router->interfaces[$interface_name] = EncapsulateInterface($router, $interface_name, $net_interface, $vrf_num, $subconstant, $next_hop, true);
+                } else {
+                    EncapsulateInterface($router, $interface_name, $net_interface, $vrf_num, $subconstant, $next_hop, false);
+                }
+
+                if (strtolower($interface_name[0]) == "l") { // This is a loopback
+                    preg_match('/([a-zA-Z]+)(\d+)/', $interface_name, $matches);
+                    $numericPortion = intval($matches[2]);
+                    $interface_name = $matches[1] . strval((($vrf_num - 1) * 10) + $numericPortion); // 10 lopbacks per vrf are supported !!!! NEED TO CHECK
+                } else {
+                    $subinterface_portion = $subconstant * 10 + $vrf_num; // limits vrfs to 10
+                    $interface_name .= ".$subinterface_portion";
+                }
+            }
+
+            $net_interface->vrf_name = $vrf_name;
+            $router->links_to_name[$vrf_name][$link] = $interface_name; //ensure that the new subinterface name can be found using the logical link number
+            $router->interfaces[$interface_name] = $net_interface;
+        }
+
+        // now loop through a second time with the subinterfaces created to ensure that any using frame realy have correct DLCI
+        foreach ($router->interfaces as $interface_name => $net_interface) {
+            if (isset($net_interface->fr_mapIP) && !isset($net_interface->fr_mapDLCI)) {
+                $dlci = $router->used_DLCIs[0]; // setting to start may be a weird choice but becuase some numbers get skipped due to links needing to match, and ther are limited number of valid DLCI values allowed we want to be as dense as possible
+                while (in_array($dlci, $router->used_DLCIs)) {
+                    $dlci += 1;
+                }
+                array_push($router->used_DLCIs, $dlci);
+                $net_interface->fr_mapDLCI = $dlci;
+            }
+        }
+
+        //Attach Routing Protocols
+        foreach ($routing_protocols[$vrfs[$v]][$model_name] as $name => $protocols) {
+            if (!isset($router->routing_itp[$name])) {
+                $router->routing_itp[$name] = [];
+            }
+            foreach ($protocols as $protocol) {
+                $protocol->vrf_name = $vrf_name;
+
+                if ($name == "bgp") {
+                    if (strtolower($vrf_name) != "global") {
+                        $router->vrfs[$vrf_name]->rds[$protocol->as_number] = $vrf_num; //add route distinguishers for bgp
+                    }
+                    foreach ($protocol->bgp_neighbors as $nei) {
+                        if (isset($nei->update_source)) {
+                            $nei->update_source = $router->links_to_name[$vrf_name][$nei->update_source];
+                        } //translate updatesource interface
+                    }
+                } else if ($name == "ospf") {
+                    $protocol->proc_id = $vrf_num * 100 + $protocol->proc_id;
+                }
+
+                //tranlate advertisment logical links to actual naem
+                foreach ($protocol->networks as $link => $empty) {
+                    if ($name == "bgp") { #need a way to remove erraneous bgp advertisments remebre the link is address mask pair so cant do below.
+                        #if(!isset($physical[$router_key]["Interfaces"][$link])) {unset($routing_protocol->networks[$interfaces[$model_name][$link]->address]); continue;}
+                    } else {
+                        if (!isset($physical[$router_key]["Interfaces"][$link])) {
+                            unset($protocol->networks[$link]);
+                            continue;
+                        }
+                        $interface_name = $router->links_to_name[$vrf_name][$link];
+                        $protocol->networks[$interface_name] = $empty;
+                        unset($protocol->networks[$link]);
+
+                        if ($name == "ospf") {
+                            if (strpos(strtolower($interface_name), "s") !== false) {
+                                $router->interfaces[$interface_name]->loopback_ospf_good = true;
+                            }
+                        }
+                    }
+                }
+                array_push($router->routing_itp[$name], $protocol);
+            }
+        }
+
+        // Atach Components
+        //lists is for tracing the dependancies of acl/prefix/routemaps
+        $lists = call_user_func_array('array_merge', array_values(array_filter($components[$vrf_name][$model_name], function ($key) {
+            return $key == "acl" || $key == "prefix" || $key == "route_map";
+        }, ARRAY_FILTER_USE_KEY)));
+
+
+        foreach ($components[$vrf_name][$model_name] as $component_name => $component_list) {
+            foreach ($component_list as $component) {
+                if ($component_name == "syslog") {
+                    $component->source_interface = isset($component->source_interface) ? $router->links_to_name[$vrf_name][$component->source_interface] : null;
+                    $router->syslog = $component; // there should only be one syslog config
+                }
+                if ($component_name == "snmp") {
+                    $parts = explode(" ", $router_key);
+                    $component->location .= "-$parts[0]$parts[1]";
+                    $router->snmp = $component;
+                }
+                if ($component_name == "ntp") {
+                    $router->ntp = $component; // there should only be onentp ocnfig
+                }
+                if ($component_name == "acl") {
+                    ResolveInterfaceID($component, $router->links_to_name[$vrf_name]);
+                    if (CheckListDependancies($component, $lists)) {
+                        array_push($router->aclconfig, $component);
+                    }
+                }
+                if ($component_name == "prefix") {
+                    ResolveInterfaceID($component, $router->links_to_name[$vrf_name]);
+                    if (CheckListDependancies($component, $lists)) {
+                        array_push($router->prefixes, $component);
+                    }
+                }
+                if ($component_name == "route_map") {
+                    ResolveInterfaceID($component, $router->links_to_name[$vrf_name]);
+                    if (CheckListDependancies($component, $lists)) {
+                        array_push($router->routemaps, $component);
+                    }
+
+                    // make sure that neighbors routemaps actually exist after dependency check
+                    foreach ($router->routing_itp["bgp"] as $bgp_protocol) {
+                        foreach ($bgp_protocol->bgp_neighbors as $nei) {
+                            if (isset($nei->route_map_in) && count(array_filter($router->routemaps, function ($value) use ($nei) {
+                                return $value->name = $nei->route_map_in;
+                            })) == 0) {
+                                unset($nei->route_map_in);
+                            }
+                            if (isset($nei->route_map_out) && count(array_filter($router->routemaps, function ($value) use ($nei) {
+                                return $value->name = $nei->route_map_out;
+                            })) == 0) {
+                                unset($nei->route_map_out);
+                            }
+                        }
+                    }
+                }
+                if($component_name == "arbitrary") {
+                    ResolveInterfaceID($component, $router->links_to_name[$vrf_name]);
+                    array_push($router->arbitrarys, $component);
+                }
+            }
+        }
+    }
+
+    return $router;
+}
+
+#---------------------------- Core Loop and Program ----------------------------------------------#
+
+
+####################################################################################################
+# ConstructConfigs
+# 
+# This is responsible for creating an array of RouterConfig Objects to store the concrete
+# cofnigurations to be uploaded to the devices.
+# The order of replication matters as it defines what container is connected to another.
+# e.g. Iterating throug White, Purple, Orange, Implies that White is connected to Purple, and purple is connceted to orange.
+# o rooms - a deep array/tree soritng routers by colour of each container
+# o room_indexs - an array that holds refereces to the router but is indexed with integers, the index is based on the index of the colour in the replicaiotn .ini                                                                                #
+####################################################################################################
+function ConstructConfigs($templates, $replication, $physical, $topologies)
+{
+    $rooms = [];
+    $rooms_indexed = [];
+    $network_details = [];
+    $vrfs = array_keys($replication["VRF"]);
+    foreach ($templates as $name => $template) {
+        $network_details[$name] = [];
+        $network_details[$name]["Networks"] = $template["Networks"];
+
+        foreach ($topologies[$name] as $model_id => $model) {
+            if (!isset($template[$model_id]["Routing"])) {
+                continue;
+            }
+            foreach ($template[$model_id]["Routing"] as $prot) {
+
+                $network_details[$name][$prot] = $template[$prot];
+            }
+        }
+    }
+    $interfaces = [];
+    $routing_protocols = [];
+    $components = [];
+    $index = 0;
+
+    for ($f = 0; $f < count($replication["Rooms"]["Room"]); $f++) { # Rooom Iteration
+
+        $room_key = $replication["Rooms"]["Room"][$f];
+        $rooms[$room_key] = [];
+        $racks = $replication["Racks"][$room_key] ?? ($replication["Racks"]["All"]);
+        if($racks == null) {echo "!!! Racks are missing for the Room $room_key, Check Replication File !!!"; exit(1);}
+        for ($g = 0; $g < count($racks); $g++) # Rack Iteration
+        {
+            $rack_key = $racks[$g];
+            $rooms[$room_key][$rack_key] = [];
+            $kits = $replication["Kits"][$rack_key] ?? $replication["Kits"]["All"];
+            if($kits == null) {echo "!!! Kits are missing for the $rack_key Rack, Check Replication File !!!"; exit(1);}
+            for ($h = 0; $h < count($kits); $h++) #Kit Iteration
+            {
+                $kit_key = $kits[$h];
+                $rooms[$room_key][$rack_key][$kit_key] = [];
+
+                for ($i = 0; $i < count($replication["Routers"]["Router"]); $i++) #Router Iteration
+                {
+                    $router_key = $replication["Routers"]["Router"][$i];
+
+                    for ($v = 0; $v < count($vrfs); $v++) {
+                        if ($i % count($templates[$vrfs[$v]]["Models"]) == 0) { # do a whole network at a time thus only do it based on the models
+                            list($interfaces[$vrfs[$v]], $routing_protocols[$vrfs[$v]], $components[$vrfs[$v]]) = ConstructComponents($rooms_indexed, $index, $templates[$vrfs[$v]], $replication, $physical, $topologies[$vrfs[$v]], $network_details[$vrfs[$v]], $room_key, $rack_key, $kit_key);
+                        }
+                    }
+                    $rooms[$room_key][$rack_key][$kit_key][$router_key] = BuildRouter($router_key, $rooms_indexed, $index, $physical, $templates, $topologies, $vrfs, $interfaces, $routing_protocols, $components);
+                    $rooms_indexed[$index] = &$rooms[$room_key][$rack_key][$kit_key][$router_key];
+
+                    $index++;
+                }
+            }
+        }
+    }
+    // foreach ($rooms as $room_key => $racks) {
+    //     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+    //     echo "                  $room_key                       \n";
+    //     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+    //     foreach ($racks as $rack_key => $kits) {
+    //         echo "___________________________________________________________\n
+    //          |                           Rack                               |
+    //          |________________________ $rack_key __________________________|\n";
+    //         foreach ($kits as $kit_key => $ros) {
+    //             echo "##########Kit $kit_key##########\n";
+    //             foreach ($ros as $router_key => $router) {
+    //                 echo "-------------$router_key------------\n";
+    //                 echo "{$router->ConstructConfigString()}\n";
+    //             }
+    //         }
+    //     }
+    // }
+    return $rooms;
+}
+
+####################################################################################################
+# ConstructTopology
+# Creates an array of connected nodes that describe the network device connecitons based of the template
+# o template - this deteremines the devices, inerfaces and connections                                                                             #
+####################################################################################################
+
+function ConstructTopology($template, $vrf_name)
+{
+    $nodes = [];
+    //Create Nodes First
+    foreach ($template["Models"] as $id) {
+        $nodes[$id] = new Node($id, $vrf_name);
+    }
+    //add the interfaces
+    foreach ($template["Models"] as $id) {
+        $interfaces = $template[$id]["Interfaces"];
+        foreach ($interfaces as $int) {
+            $parts = explode(":", $int);
+            $nodes[$id]->AddConnection($parts[1], $nodes[$parts[2]], $parts[3], $parts[0], $parts[4]);
+        }
+    }
+    return $nodes;
+}
+
+
+####################################################################################################
+# MAIN PROGRAM                                                                                     #
+####################################################################################################
+
+// Check command line parameters
+if (count($argv) != 4) {
+    echo "Usage: $argv[0] <config_replication> <config_physical> <job_name>\n";
+    echo "
+  <config_replication>  : The INI file that specifies details of how replication of devices will occur and what templates to use
+  <config_physical>     : The Ini file mapping logical properties to the physical properties of the devices\n
+  <job_name>            : Name to be given to the job and save directory\n";
+    exit(1);
+}
+
+if (($replication = parse_ini_file($cisco_configs["template_path"] . "/replication/" . $argv[1], true)) == false) {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading replcication INI file: {$argv[2]}\n";
+    exit(1);
+}
+if (($physical = parse_ini_file($cisco_configs["physical_path"] . "/" . $argv[2], true)) == false) {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading physical INI file: {$argv[3]}\n";
+    exit(1);
+}
+
+$templates = [];
+$topology = [];
+$filepathbits = explode("/", $argv[1]);
+$filepathbits = array_slice($filepathbits, 0, -1);
+$filepath = implode("/", $filepathbits);
+foreach ($replication["VRF"] as $name => $template_file) {
+    $filename = "$filepath/$template_file";
+    if (($template = parse_ini_file($cisco_configs["template_path"] . "/config/" . $filename, true)) == false) {
+        echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading template INI file: {$filename}\n";
+        exit(1);
+    }
+    $templates[$name] = $template;
+    $topologies[$name] = ConstructTopology($template, $name);
+}
+
+$rooms = ConstructConfigs($templates, $replication, $physical, $topologies);
+$output_directory = "{$cisco_configs["network_path"]}/{$argv[3]}";
+GenerateUploadINI($output_directory, $rooms);
+
+?>

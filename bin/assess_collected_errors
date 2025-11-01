@@ -1,0 +1,224 @@
+#!/usr/bin/php -f
+<?php
+
+##################################################################################################################################################################
+## Load Cisco Marking Configuration Values                                                                                                                      ##
+##################################################################################################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+##################################################################################################################################################################
+## Include the base rubric class definition                                                                                                                     ##
+##################################################################################################################################################################
+require_once("{$cisco_configs["lib_path"]}/rubrics/Base.php");
+
+##################################################################################################################################################################
+## Help for pretty output                                                                                                                                       ##
+##################################################################################################################################################################
+function print_colour($colour, $text)
+{
+  if($colour == "")           echo "\033[0;37;40m";
+  else if($colour == "red")   echo "\033[7;31;40m";
+  else if($colour == "pink")  echo "\033[1;31;40m";
+  else if($colour == "green") echo "\033[7;32;40m";
+  else if($colour == "brown") echo "\033[7;33;40m";
+  else if($colour == "cyan")  echo "\033[1;36;40m";
+  echo "$text\033[0;37;40m";
+}
+
+##################################################################################################################################################################
+## CREATE SPECIFIED RUBRICS                                                                                                                                     ##
+##################################################################################################################################################################
+## Create all rubrics based on names and configuration specified in $rubric_details                                                                             ##
+## - Loop through each rubric to build                                                                                                                          ##
+##   o Determine the filename containing the rubric defination and the class name to instantiate the rubric instance                                            ##
+##   o If the filename exists                                                                                                                                   ##
+##     - Include the file containing the rubric                                                                                                                 ##
+##     - Create an instance of the rubric and store it in the $rubrics array to return                                                                          ##
+##   o If the file does not exist                                                                                                                               ##
+##     - Print a warning message indicating that the rubric could not be instantiated                                                                           ##
+## - If no rubrics were able to be created, print an error message and return                                                                                   ##
+## - Return the array of generated rubrics                                                                                                                      ##
+##################################################################################################################################################################
+function CreateRubrics($rubric_details, $output_directory)
+{
+  global $cisco_configs;
+
+  echo "\n  Setting Rubrics...\n";
+
+  foreach ($rubric_details as $rubric_name => $rubric_config)
+  {
+    $library_file = "{$cisco_configs["lib_path"]}/rubrics/$rubric_name/$rubric_name.php";
+    $class_name = "Rubric_$rubric_name";
+    if (file_exists($library_file))
+    {
+      require_once($library_file);
+      $rubrics[$rubric_name] = new $class_name($rubric_config, $output_directory);
+    } else
+    {
+      print_colour("pink", "    WARNING:");
+      echo "\t\t\t\tNominated rubric \"$rubric_name\" is not available on this system\n";
+    }
+  }
+
+  if (count($rubrics) === 0)
+  {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m No valid rubrics specified in INI file\n";
+    exit(1);
+  }
+
+  return $rubrics;
+}
+
+##################################################################################################################################################################
+## LOAD SAVED EXAM OPTIONS                                                                                                                                      ##
+##################################################################################################################################################################
+## Load any saved exam optional parameters                                                                                                                      ##
+## - If there aren't any options in this exam return an empty string                                                                                            ##
+## - If the saved option file doesn't exist, fail with an error                                                                                                 ##
+## - Parse the saved option file into $exam_options and create a human readable string representation of all configured options to return                       ##
+##################################################################################################################################################################
+function LoadExamOptions($option_file)
+{
+  global $exam_details;
+
+  if ((!in_array("Exam Options", array_keys($exam_details))) || (count($exam_details["Exam Options"]) == 0)) return "";
+
+  echo "\n  Loading saved exam options...\t";
+  if (!file_exists($option_file)) 
+  {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m Exam options file ($option_file) does not exist\n";
+    exit(1);
+  }
+
+  $exam_options = parse_ini_file($option_file, true);
+
+  $options_description = "Your exam settings were:\n";
+  foreach ($exam_details["Exam Options"] as $variable => $information)
+  {
+    print_colour('cyan', "\t$variable({$exam_options['Student Options'][$variable]})");
+    $options_description.= "  " . str_pad("$information[0]:", 20) . $exam_options['Student Options'][$variable] . "\n";
+  }
+
+  echo "\n";
+
+  return $options_description;
+}
+
+##################################################################################################################################################################
+## LOAD SAVED EXAM ERRORS                                                                                                                                       ##
+##################################################################################################################################################################
+## All exam errors are saved in an INI file, load the INI file and return the array. If the file does not exist, there are no errors so return NULL             ##
+##################################################################################################################################################################
+function LoadExamErrors($errors_file)
+{
+  echo "\n  Loading saved exam errors...";
+
+  if (file_exists($errors_file)) 
+  {
+    print_colour('cyan', "\t\t" . basename($errors_file) . "\n");
+    $exam_errors = parse_ini_file($errors_file, true);
+
+    return $exam_errors;
+  }
+
+  print_colour('cyan', "\t\tnone\n");
+  return NULL;
+}
+
+##################################################################################################################################################################
+## MARK EXAMS AGAINST ALL RUBRICS                                                                                                                               ##
+##################################################################################################################################################################
+## If there are no exam errors, simply return                                                                                                                   ##
+## Loop through each actual error (class/type/message) and log the error against each rubric in the global $rubrics array                                       ##
+##################################################################################################################################################################
+function MarkExam($exam_errors)
+{
+  global $rubrics;
+  
+  if (is_null($exam_errors)) return;
+
+  echo "\n  Marking Exam...\n";
+
+  foreach ($exam_errors as $class => $details)
+    foreach ($details as $type => $error_messages)
+      foreach ($error_messages as $message)
+        foreach ($rubrics as $rubric)
+          $rubric->log_error($class, $type, $message);
+}
+
+##################################################################################################################################################################
+## SAVE MARKING OUTPUT EXAMS AGAINST ALL RUBRICS                                                                                                                ##
+##################################################################################################################################################################
+## All the errors have been logged against each rubric. We need to call save_result() on each rubric to save the corresponding output file. When this is called ##
+## we need to ensure that the ESP link is created for the Master rubric and that we return the stored results for the $master_rubric                            ##
+##################################################################################################################################################################
+function SaveResults($master_rubric, $pass_message, $fail_message, $create_esp)
+{
+  global $rubrics, $options_description;
+
+  echo "\n  Saving results files...\n";
+
+  foreach ($rubrics as $rubric_name => $rubric)
+    $results[$rubric_name] = $rubric->save_result($options_description, $pass_message, $fail_message, ($create_esp && ($rubric_name === $master_rubric)));
+
+  return $results[$master_rubric];
+}
+
+##################################################################################################################################################################
+## MAIN PROGRAM STARTS FROM HERE                                                                                                                                ##
+##################################################################################################################################################################
+## Parse command line parameters
+if ($argc != 3) 
+{
+  echo "Usage: $argv[0] <exam_config_file> <router_collection_directory>\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$collect_dir = $argv[2];
+
+print_colour('cyan', "Applying rubric to marked configuration in $collect_dir using exam configuration $exam_config_file\n");
+
+## Load information about the exam
+$exam_details = parse_ini_file($exam_config_file, true);
+
+## If no rubrics are set in the INI file, force creation of the default "Feedback" rubric
+if (count($exam_details['Marking']['rubric']) === 0) $exam_details['Marking']['rubric']["Feedback"] = NULL;
+
+## Create all required rubrics as configured in the INI file
+$rubrics = CreateRubrics($exam_details['Marking']['rubric'], $collect_dir);
+
+## Get any per-exam options saved as a description string, then append a line for pretty output
+$options_description = LoadExamOptions("$collect_dir/options.ini") . "------------------------------------\n\n";
+
+## Get any mistakes made in the configuration. If no mistakes are made, this will be NULL
+$exam_errors = LoadExamErrors("$collect_dir/errors.ini");
+
+## Mark the student configuration against all rubrics
+MarkExam($exam_errors);
+
+## Save all the result files, returning the result from the master rubric
+$result = SaveResults(array_shift(array_keys($exam_details['Marking']['rubric'])), 
+                      "Congratulations, you have passed the {$exam_details['Exam Details']['name']}", 
+                      "You have committed a series of errors that have resulted in you failing the {$exam_details['Exam Details']['name']}",
+                      isset($exam_details["ESP"])
+                     );
+
+
+## Output exam results
+echo "\n  Student Result...\t\t\t";
+
+if ($result['score'] > 0)
+  print_colour('cyan', "PASS ({$result['score']})\n");
+else
+  print_colour('pink', "FAIL ({$result['score']})\n");
+
+echo "\n{$result['feedback']}";
+
+exit($result['score']);
+
+?>

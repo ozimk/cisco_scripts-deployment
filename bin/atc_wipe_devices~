@@ -1,0 +1,573 @@
+#!/usr/bin/php
+<?php
+
+####################################################################################################
+# Load Cisco Marking Configuration Values                                                          #
+####################################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+####################################################################################################
+# Load the provided system_functions library                                                       #
+####################################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Include libraries to access a device via ssh(Swinburne ATC lab setup).       #
+################################################################################
+#require_once("{$cisco_configs["lib_path"]}/consolessh.php");
+
+################################################################################
+# Include libraries to talk to and capture stuff from a device (password       #
+# support is still crap                                                        #
+################################################################################
+#$password = "cisco";
+
+#require_once("{$cisco_configs["lib_path"]}/devicecontrol.php");
+
+####################################################################################################
+#                    >>>>>>>>>> FETCH DEVICE INFORMATION FUNCTIONS <<<<<<<<<<                      #
+####################################################################################################
+# Servers to contact to download information about device allocation and access information from   #
+# for each room in the ATC building                                                                #
+####################################################################################################
+$atc_servers = array(8 => array("description" => "Cisco Devices in ATC328",
+                                "url"         => "https://ictencsvr1.ict.swin.edu.au/agent/get_all.php",
+                               ),
+
+                     9 => array("description" => "Cisco Devices in ATC329",
+                                "url"         => "https://ictencsvr6.ict.swin.edu.au/agent/get_all.php",
+                               ),
+
+                     0 => array("description" => "Cisco Devices in ATC330",
+                                "url"         => "https://ictencsvr11.ict.swin.edu.au/agent/get_all.php",
+                               )
+                    );
+
+################################################################################
+# Menu items to help select sub-sets of devices                                #
+################################################################################
+#$rack_filters = array(".+" => "All Enclosures", "Black" => "Black Enclosure", "Red" => "Red Enclosure", "Blue" => "Blue Enclosure", "Green" => "Green Enclosure", "Yellow" => "Yellow Enclosure");
+
+#$kit_filters = array(".+" => "All Kits", "White" => "White Kit", "Purple" => "Purple Kit", "Orange" => "Orange Kit", "Green" => "Green Kit", "Yellow" => "Yellow Kit");
+
+#$device_filters = array("Router 1", "Router 2", "Router 3", "Router 4", "Switch 1", "Switch 2", "Switch 3", "Switch 4");
+
+####################################################################################################
+####################################################################################################
+function AskTerminate()
+{
+  if (DisplayYesNo("Terminate Program", "Are you sure that you want to terminate upload now?", "Upload Device Configuration"))
+    exit(1);
+}
+
+####################################################################################################
+# GetATCServerList()                                                                               #
+#                                                                                                  #
+# Asks the user which rooms to upload device configurations to. The list of possible rooms is in   #
+# the global $atc_servers variable. A dialog box with a checklist of rooms is displayed, allowing  #
+# users the option of terminating the program. We loop repeatedly until the user quits or selects  #
+# at least one room. The selected rooms are returned in an array of indexes to the global          #
+# $atc_servers array                                                                               #
+####################################################################################################
+function GetATCServerList()
+{
+  global $atc_servers;
+
+  foreach ($atc_servers as $key => $details) $items[$key] = $details["description"];
+
+  while (true)
+  {
+//    $choice = DisplayCheckList(" ATC Room Selection ",
+    $choice = DisplayRadioList(" ATC Room Selection ",
+                               "Please select which rooms you would like to upload device configurations to",
+                               $items,
+                               "Upload Device Configuration",
+                               '--cancel-label "Quit"', "ATC328"
+//                               '--cancel-label "Quit"'
+                              );
+
+    switch ($choice->code)
+    {
+      case 0:
+        $selected = array_filter(explode(" ", $choice->output));
+        array_walk($selected, create_function('&$val', '$val = trim($val, \'"\');'));
+        if (count($selected) > 0) return $selected;
+
+        DisplayMessage(" ATC Room Selection ",
+                       "ERROR: You must select at least one room to upload device configurations to",
+                       "Upload Device Configuration"
+                      );
+        break;
+      default:
+        AskTerminate();
+    }
+  }
+}
+
+####################################################################################################
+# GetAuthDetails()                                                                                 #
+#                                                                                                  #
+# Asks user for their SIMS username and password, also allows user to terminate the program. We    #
+# loop repeatedly until the user quits or enters some details. Entered password is hashed out for  #
+# privacy, entered details are returned as an array                                                #
+####################################################################################################
+function GetAuthDetails()
+{
+  while (true)
+  {
+    exec('dialog --backtitle "Upload Device Configuration" \
+                 --stdout --colors --insecure --cancel-label "Quit" \
+                 --title " ATC Website Authentication Information " \
+                 --mixedform "Enter Swinburne SIMS Details below:\n" 25 70 15 \
+                             "Username:" 2 2 "" 2 15 50 50 0 \
+                             "Password:" 4 2 "" 4 15 50 50 1',
+         $output, $result);
+
+    echo "\n";
+    if ($result == 0) return array("username" => $output[0], "password" => $output[1]);
+
+    AskTerminate();
+  }
+}
+
+####################################################################################################
+# FetchRoomDetails($url, $auth_details)                                                            #
+#                                                                                                  #
+# Connects to the specified URL using the provided authentication details and attempts to download #
+# device details for the corresponding room. Possible outcomes are:                                #
+#  - Error connecting to server, terminate program with error message                              #
+#  - Authentication error, display error message and return false to force program to re-query     #
+#    user for authentication details                                                               #
+#  - Return content of response, list of pre-formatted device details                              #
+####################################################################################################
+function FetchRoomDetails($url, $auth_details)
+{
+  $httpquery = new HttpRequest();
+
+  $httpquery->setURL($url);
+  $httpquery->setMethod(HttpRequest::METH_POST);
+  $httpquery->setPostFields($auth_details);
+  $httpquery->send();
+
+  if ($httpquery->getResponseCode() != 200)
+  {
+    DisplayMessage(" ERROR Accessing Site ", "Unable to connect to $url, this is a terminal problem", "Upload Device Configuration");
+    exit(1);
+  }
+
+  $result = $httpquery->getResponseData();
+
+  if ($result["body"] == "Logon error\n")
+  {
+    DisplayMessage(" ERROR Authenticating ", "Bad username/password combination supplied");
+    return false;
+  }
+
+  return $result["body"];
+}
+
+####################################################################################################
+# DownloadDeviceDetails($server_list, $description)                                                #
+#                                                                                                  #
+# Returns an array containing all the downloaded device details from the nominated ATC servers     #
+#  - Loop through each room we are uploading to                                                    #
+#    o Attempt to fetch the details of devices for that room                                       #
+#      - FetchRoomDetails() will terminate on a error or return false if authentication fails      #
+#    o While authentication fails, re-query the user for username/password                         #
+#    o Append the returned details to $devices                                                     #
+#  - All OK, break the downloaded data into an array for the function response                     #
+#  - If no devices available, terminate with an error message                                      #
+####################################################################################################
+function DownloadDeviceDetails()
+{
+  global $atc_servers, $server_list, $auth_details;
+
+  $devices = "";
+  
+  foreach ($server_list as $index)
+  {
+    DisplayStatus(" Fetching Device Connection Details ", $atc_servers[$index]["description"], "Upload Device Configuration");
+    while (($details = FetchRoomDetails($atc_servers[$index]["url"], $auth_details)) === false)
+    {
+      $auth_details = GetAuthDetails();
+      DisplayStatus(" Fetching Device Connection Details ", $atc_servers[$index]["description"], "Upload Device Configuration");
+    }
+
+    $devices.= $details;
+  }
+
+  $device_list = explode("\n", trim($devices));
+
+  if (strlen($devices) > 0) return $device_list;
+
+  echo "\033[1;31;40mERROR:\033[0;37;40m You have no devices available to upload to\n";
+  exit(1);
+}
+
+####################################################################################################
+# Find_Config_File($enclosure, $kit, $device)                                                      #
+#                                                                                                  #
+# For the given device, return the name of the file containing the configurations that this device #
+# should be programmed with based on the values in the configuration file. While other matches     #
+# than those listed below may be possible, they are not useful so are ignored. We have priorities  #
+# to allow specific configs to overide global configuration files                                  #
+# Return stored values in the global config on the following priorities:                           #
+# - An exact match for the enclosure, kit, and device                                              #
+# - An exact match for the kit and device                                                          #
+# - An exact match for the enclosure and device                                                    #
+# - An exact match for the device only (any enclosure/kit)                                         #
+# - No matches, return an empty string                                                             #
+####################################################################################################
+function Find_Config_File($enclosure, $kit, $device)
+{
+  global $device_configs;
+
+  if (array_key_exists($enclosure, $device_configs) && array_key_exists($kit, $device_configs[$enclosure]) && array_key_exists($device, $device_configs[$enclosure][$kit]))
+    return $device_configs[$enclosure][$kit][$device];
+
+  if (array_key_exists('Any', $device_configs) && array_key_exists($kit, $device_configs['Any']) && array_key_exists($device, $device_configs['Any'][$kit]))
+    return $device_configs['Any'][$kit][$device];
+
+  if (array_key_exists($enclosure, $device_configs) && array_key_exists('Any', $device_configs[$enclosure]) && array_key_exists($device, $device_configs[$enclosure]['Any']))
+    return $device_configs[$enclosure]['Any'][$device];
+
+  if (array_key_exists('Any', $device_configs) && array_key_exists('Any', $device_configs['Any']) && array_key_exists($device, $device_configs['Any']['Any']))
+    return $device_configs['Any']['Any'][$device];
+
+  return "";
+}
+
+####################################################################################################
+# FilterDevices($device_list)                                                                      #
+#                                                                                                  #
+# Filter the complete list of booked devices to match those specified within the configuration     #
+# file (stored in $device_configs) and create a return array storing the login details for these   #
+# devices and the filename containing the configuration to upload to each device:                  #
+# - Loop through all the devices we have booked:                                                   #
+#   o Break the string into multiple parameters separated by ':'                                   #
+#   o Locate the positions of of the open and close brackets in the $device_name, this indicates   #
+#     the colours of the Rack and Kit for this particular device                                   #
+#   o Extract information about the enclosure colour, kit colour, and device type/number           #
+#   o Find the filename containing the configuration for this device                               #
+#   o If a config file exists, then create the array entry storing this detail                     #
+####################################################################################################
+function FilterDevices($device_list)
+{
+  $result_array = array();
+
+  foreach ($device_list as $device_details)
+  {
+    $detail_array = explode(":", $device_details);
+    $device_name = $detail_array[5];
+
+    $first_bracket = strpos($device_name, "(");
+    $first_bracket_end = strpos($device_name, ")");
+    $last_bracket = strrpos($device_name, "(");
+    $last_bracket_end = strrpos($device_name, ")");
+
+    $enclosure = substr($device_name, $first_bracket+1, $first_bracket_end - $first_bracket-1);
+    $kit = substr($device_name, $last_bracket+1, $last_bracket_end - $last_bracket-1);
+    # Set $device to the lower case version of string/router/asa
+    $device = strtolower(substr(trim(substr($device_name, $last_bracket_end+2)), 0, -2));
+
+    $result_array[$detail_array[5]] = array("server"   => $detail_array[1],
+                                            "username" => $detail_array[2],
+                                            "password" => $detail_array[3],
+                                            "fullname" => $detail_array[5],
+                                            "nickname" => $detail_array[5],
+                                            "type"     => $device
+                                           );
+  }
+
+  return $result_array;
+}
+
+####################################################################################################
+# FetchDeviceList()                                                                                #
+#                                                                                                  #
+# Returns a subset of devices in the ATC labs along with connection details. The subset contains   #
+# all devices to upload configs to, their connection details, and the file containing the          #
+# configuration commands                                                                           #
+# - Call GetATCServerList() to select which rooms to configure (list stored in $server_list)       #
+# - Call GetAuthDetails() to request username/password combination to use when connecting to the   #
+#   ATC servers (details stored in $auth_details)                                                  #
+# - Call DownloadDeviceDetails() to download connection details for ALL booked devices in selected #
+#   rooms (details stored in $device_list)                                                         #
+# - Return result of FilterDevices() which contains connection and config file details of the      #
+#   devices we actually need to configure                                                          #
+####################################################################################################
+function FetchDeviceList()
+{
+  global $server_list, $auth_details;
+
+  $server_list = GetATCServerList();
+  $auth_details = GetAuthDetails();
+
+  $device_list = DownloadDeviceDetails();
+
+  return FilterDevices($device_list);
+}
+
+####################################################################################################
+#                          >>>>>>>>>> CHILD PROCESS FUNCTIONS <<<<<<<<<<                           #
+####################################################################################################
+# sig_child($signal)                                                                               #
+#                                                                                                  #
+# Called whenever a child process dies, this can happen in three ways:                             #
+#  1) success                                                                                      #
+#  2) failure                                                                                      #
+#  3) termination                                                                                  #
+#                                                                                                  #
+# Wait for a particular process to cleanup (pcntl_wait()) in a loop (so we handle all dead         #
+# processes in the handler (we return when no more terminated child processes exist. For each      #
+# terminated child process ($pid):                                                                 #
+# - Get the $device_name allocated to that child process                                           #
+# - If the process was killed, set the error_message data field in $device_db for this device to   #
+#   reflect what happened                                                                          #
+# - If the process terminated but returned failure, set the error_message data field in $device_db #
+#   for this device to reflect what happened and increment the $borked_pids count so we know how   #
+#   many have failed pre-maturely                                                                  #
+# - Otherwise the collection worked OK, we remove the $pid from the list of child PIDs so we know  #
+#   which processes are still executing                                                            #
+####################################################################################################
+function sig_child($signal)
+{
+  global $device_db, $child_pids, $borked_pids;
+
+  while(($pid = pcntl_wait($status, WNOHANG)) > 0)
+  {
+    $device_name = $child_pids[$pid];
+
+    if (!pcntl_wifexited($status))
+      $device_db[$device_name]["error_message"] = "Upload process timed-out and was forcibly terminated";
+    else if (pcntl_wexitstatus($status) > 0) 
+    {
+      $device_db[$device_name]["error_message"] = "Upload process returned failure";
+      $borked_pids++;
+    } else
+    {
+      unset($child_pids[$pid]);
+    }
+  }
+}
+
+####################################################################################################
+# Countdown_Delay($delay)                                                                          #
+#                                                                                                  #
+# Display a progress indicator including successful uploads, failed uploads, and a countdown timer #
+# If all uploads succeed, terminate the delay/loop, if all processes are finished (either          #
+# successfully or not) terminate the delay/loop                                                    #
+####################################################################################################
+function Countdown_Delay($delay)
+{
+  global $child_pids, $borked_pids;
+
+  $total_jobs = count($child_pids);
+
+  $progress_items = array();
+
+  $progress_items["Running wipeout:"]          = "($total_jobs)";
+  $progress_items["Failed wipeout:"]           = "(None)";
+  $progress_items["Countdown timer"] = "-100";
+
+  for ($count = $delay; $count > 0; $count--)
+  {
+    $progress_items["Running uploads:"]          = "(" . count($child_pids) . ")";
+    if ($borked_pids > 0) $progress_items["Failed uploads:"] = "($borked_pids)";
+    $progress_items["Countdown timer"] = "-" . round(100 - (100 * $count / $delay));
+    $percent_complete = 100 - (100 * (count($child_pids) + $borked_pids) / $total_jobs);
+
+    DisplayProgress("Upload progress", $percent_complete, "Overall percentage of completed uploads", $progress_items, "Upload Device Configuration");
+
+    // Terminate loop early if there are no more child processes running
+    if (count($child_pids) === 0) return;
+
+    // Terminate loop early if the remaining child processes are all borked
+    if ($borked_pids === count($child_pids)) return;
+
+    // Pause and continue
+    sleep(1);
+
+    pcntl_signal_dispatch();
+  }
+}
+
+####################################################################################################
+# TerminateChildren($child_pids)                                                                   #
+#                                                                                                  #
+# Terminate all children in the provided list of processes, wait for the process to actually die   #
+####################################################################################################
+function TerminateChildren($child_pids)
+{
+  global $child_pids, $borked_pids;
+
+  $total_children = count($child_pids);
+  $count = 0;
+
+  foreach ($child_pids as $pid => $device_details)
+  {
+    if (posix_kill($pid, 0))
+    {
+      DisplayProgress("Terminating Stuck Collection Processes", 100 * $count / $total_children, "Killing process $pid...\n", array(), $exam_details["Exam Details"]["name"]);
+
+      posix_kill($pid, SIGINT);
+    }
+    pcntl_waitpid($pid, $status);
+
+    $count++;
+  }
+}
+
+####################################################################################################
+# ChildProcess_UploadDevice($device_name)                                                          #
+#                                                                                                  #
+# This function uploads the provided configurarion commands to the specified device. The function  #
+# is executed as a child process, we terminate when complete                                       #
+# - Turn off output for clean display (otherwise parallel threads cause a mess)                    #
+# - Construct the command line call to the atc_program_device application to actually configure    #
+#   the device, then execute the command                                                           #
+# - Turn output back on and terminate the bjild process                                            #
+####################################################################################################
+function ChildProcess_UploadDevice($device_name)
+{
+  global $cisco_configs, $device_db;
+
+  ob_start();
+
+  $uri      = $device_db[$device_name]["server"];
+  $username = $device_db[$device_name]["username"];
+  $password = $device_db[$device_name]["password"];
+  $nickname = $device_db[$device_name]["nickname"];
+  $type     = $device_db[$device_name]["type"];
+
+  $exec_command = "{$cisco_configs["bin_path"]}/atc_wipe_device '$uri' '$username' '$password' '$nickname' '$type' ";
+#  $exec_command = "{$cisco_configs["bin_path"]}/atc_program_device '$uri' '$username' '$password' '$nickname' '$config_file' ";
+
+  passthru($exec_command, $result);
+
+  ob_end_clean();
+
+  exit($result);
+}
+
+####################################################################################################
+#                           >>>>>>>>>> MAIN PROCESS FUNCTIONS <<<<<<<<<<                           #
+####################################################################################################
+# UploadDevices($inter_ssh_delay, $total_delay)                                                    #
+#                                                                                                  #
+# This function launches a series of child processes, one for each device to upload the nominated  #
+# configurations to. The global variable $child_pids stores a list of our children to aid in       #
+# process management while $borked_pids is a count of the processes that failed to connect to the  #
+# devices for upload purposes. The algorithm implemented in this function is:                      #
+#                                                                                                  #
+# - Loop through each device that we need to perform an upload for                                 #
+#   o Fork a child process and within the child process call ChildProcess_UploadDevice() to do the #
+#     actual dirty work. This function will terminate the child process on completion so we don't  #
+#     have to care about the outcome here                                                          #
+#   o Within the main program, store the device details in $child_pids so we can keep track of     #
+#     what we are doing                                                                            #
+#   o Sleep for the specified delay period to ensure we don't attempt to connect to too many       #
+#     devices simulataneously (overloads the sshd server and causes borked uploads :-)             #
+#                                                                                                  #
+# - Now all child processes are launched, call Countdown_Delay() to give the processes a chance to #
+#   successfully complete and terminate normally. This will return early if all processes finish,  #
+#   or return eventually ($total_delay seconds) if something is wrong                              #
+#                                                                                                  #
+# - If some child processes are still running, call TerminateChildren() to forcefully terminate    #
+#   them                                                                                           #
+#                                                                                                  #
+# - Create a new DB ($device_db) with the successful uploads removed. This allows us to recall the #
+#   function to retry the upload for the failed devices                                            #
+#                                                                                                  #
+# - Return false if an upload failed to indicate to the caller that the upload needs to be retried #
+####################################################################################################
+function UploadDevices($inter_ssh_delay, $total_delay)
+{
+  global $device_db, $child_pids, $borked_pids;
+
+  $pid = 0;
+  $borked_pids = 0;
+  $child_pids = array();
+
+  // Loop through each device in turn
+  foreach ($device_db as $device_name => $device_details)
+  {
+    // Parallel processing, launch a child process to capture output from
+    // the device. This process will terminate when completed
+    if (($pid = pcntl_fork()) == 0) ChildProcess_UploadDevice($device_name);
+
+    // Store the process ID so we know which devices were collected by which processes
+    $child_pids[$pid] = $device_name;
+
+    // Wait for next connection attempt
+    usleep($inter_ssh_delay);
+  }
+
+  // Give upload processes a chance to succeed
+  Countdown_Delay($total_delay);
+
+  // $child_pids contains list of processes we need to terminate
+  if (count($child_pids) > 0) TerminateChildren($child_pids);
+
+  // Use list of $child_pids to build a new, cut-down version of $device_db
+  $fail_list = array();
+  foreach ($child_pids as $pid => $device_name)
+  {
+    $fail_list[$device_name] = $device_db[$device_name];
+    $fail_list[$device_name]["error_message"] = "Upload process was forcibly terminated";
+    unset($child_pids[$pid]);
+  }
+  $device_db = $fail_list;
+
+  // If there is still something in $device_db, we failed and need to try again
+  if (count($device_db) > 0) return false;
+}
+
+####################################################################################################
+# MAIN PROGRAM                                                                                     #
+####################################################################################################
+
+// Check command line parameters
+if (count($argv) != 2)
+{
+  echo "Usage: $argv[0] <device_config_file>\n";
+  echo "
+  <device_config_file> : File containing configuration information to upload to the device(s)\n";
+  exit(1);
+}
+
+// Load INI file containing information about uploading instructions
+if (($device_configs = parse_ini_file($argv[1], true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Upload INI configuration file: {$argv[1]}\n";
+  exit(1);
+}
+
+// Download device details to upload configs to from ATC web server
+$device_db = FetchDeviceList();
+
+// Install signal handler to handle when a child(collection process dies)
+pcntl_signal(SIGCHLD, "sig_child");
+
+// Set the two delay counters from the config file or set default values if they are not user specified
+$inter_ssh_delay = (array_key_exists('inter_ssh', $device_configs))?(intval($device_configs['inter_ssh'])):0;
+$total_delay     = (array_key_exists('delay', $device_configs))?(intval($device_configs['delay'])):120;
+
+// Upload everything in a loop
+while (UploadDevices($inter_ssh_delay, $total_delay) === false)
+{
+  $message = "------------------------------------------------------------------------------------------------------\n";
+  $message.= " Failed Device Details\n";
+  $message.= "------------------------------------------------------------------------------------------------------\n";
+  foreach (array_keys($device_db) as $device_name) $message.= "$device_name\n";
+  $message.= "------------------------------------------------------------------------------------------------------\n\n";
+  $message.= "Please try to put these devices into enable more, then select Yes to try again\n";
+  if (!DisplayYesNo("Failed to upload configs for the following devices", $message, 'Upload Device Configurations'))
+    exit(1);
+}
+
+?>

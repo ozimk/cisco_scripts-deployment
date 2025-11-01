@@ -1,0 +1,59 @@
+;-------------------------------------------------------------------------------
+;-------------------------------------------------------------------------------
+[irp]
+bad_protocol                        = "The following Interior routing protocols have been erroneously configured"
+bad_inconsequential_protocol        = "The following (non-functioning) Interior routing protocols have been erroneously configured"
+protocol_not_configured             = "The following Interior routing protocols have NOT been configured"
+net_not_advertised                  = "The following networks are not being advertised when they should be"
+net_advertised                      = "The following networks are being advertised when they should not be"
+auto_summary_enable_inconsequential = "Auto-Summarisation has not been disabled on the the following devices"
+auto_summary_enable                 = "Auto-Summarisation has not been disabled on the the following devices"
+redistribute                        = "Default routes are being redistributed (but should not be) on the following devices"
+no_redistribute                     = "Default routes are not being redistributed on the following devices"
+bad_network_statements              = "The following routing protocol \"network\" statements do not advertise any interfaces on the corresponding router"
+bad_inconsequential_protocol        = "The following (non-functioning) Interior routing protocols have been erroneously configured"
+multiple_instances                  = "The following Interior Routing Protocols have multiple configured instances"
+rip_version                         = "RIP Version is incorrectly set"
+eigrp_as_mismatch                   = "EIGRP AS numbers are not common amongst configured devices"
+incorrect_eigrp_as                  = "EIGRP AS number is incorrectly set"
+
+;-------------------------------------------------------------------------------
+;-------------------------------------------------------------------------------
+[dhcp]
+not_configured = "DHCP not configured on the following devices:"
+configured     = "DHCP configured on the following devices when it should not be:"
+bad_exclusion  = "Excluded IP addresses that don\'t belong to an advertised pool"
+empty_pool     = "The following DHCP pools are not advertising any addresses"
+missing_pool   = "The following DHCP pools have not been created"
+extra_pool     = "You are advertising the following DHCP pools when you should not be"
+pool_property  = "The following DHCP Pool properties have not been correctly set"
+
+;-------------------------------------------------------------------------------
+;-------------------------------------------------------------------------------
+[stp]
+root_not_forced = "You have not forced the following root bridges to be established"
+root_incorrect  = "The incorrect switch has been configured to be the root bridge"
+bad_protocol    = "The incorrect spanning tree protocol was applied to the following devices"
+
+;-------------------------------------------------------------------------------
+;-------------------------------------------------------------------------------
+
+staticroute_checks.php:          log_error('route', 'bad_default', $device_name);
+staticroute_checks.php:    log_error('route', 'no_default_on_device', $device_name);
+staticroute_checks.php:        log_error('route', 'default_incorrect', $route_description);
+staticroute_checks.php:  if ($num_matching_routes == 0) log_error('route', 'no_default', $device_name);
+staticroute_checks.php:  if ($num_correct_matching_routes > 1) log_error('route', 'default_multiple_correct', $device_name);
+staticroute_checks.php:          log_error('route', 'bad_static', $device_name);
+staticroute_checks.php:    log_error('route', 'no_static_on_device', $device_name);
+staticroute_checks.php:          log_error('route', 'static_incorrect', $route_description);
+staticroute_checks.php:    if ($num_matching_routes == 0) log_error('route', 'no_static', $expected_route);
+staticroute_checks.php:    if ($num_correct_matching_routes > 1) log_error('route', 'static_multiple_correct', $device_name);
+staticroute_checks.php~:    log_error('route', 'no_default_on_device', $device_name);
+staticroute_checks.php~:        log_error('route', 'default_incorrect', $route_description);
+staticroute_checks.php~:  if ($num_matching_routes == 0) log_error('route', 'no_default', $device_name);
+staticroute_checks.php~:  if ($num_correct_matching_routes > 1) log_error('route', 'default_multiple_correct', $device_name);
+staticroute_checks.php~:          log_error('route', 'bad_static', $device_name);
+staticroute_checks.php~:    log_error('route', 'no_static_on_device', $device_name);
+staticroute_checks.php~:          log_error('route', 'static_incorrect', $route_description);
+staticroute_checks.php~:    if ($num_matching_routes == 0) log_error('route', 'no_static', $expected_route);
+staticroute_checks.php~:    if ($num_correct_matching_routes > 1) log_error('route', 'static_multiple_correct'

@@ -1,0 +1,124 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+$collection_script = "device_collect";
+
+################################################################################
+# GetGroupName()                                                               #
+#                                                                              #
+# Queries for a common groupname with no spaces to use to group exams after    #
+# being marked. Called once before any real work is done                       #
+################################################################################
+function GetGroupName()
+{
+  global $exam_details;
+
+  while (true)
+  {
+    $output = array();
+
+    exec('dialog --backtitle "' . $exam_details["Exam Details"]["name"] .  '" --stdout --colors --no-cancel \
+                 --title " Marking Session Name " \
+                 --inputbox "Please enter the marking session name (no spaces)" 30 70',
+         $output, $result);
+
+    if (((strlen($output[0]) > 0) && (strpos($output[0], ' ') === false))) return $output[0];
+    DisplayMessage("ERROR", "Invalid Group name (" . $output[0] . ")");
+  }
+}
+
+################################################################################
+##                     >>>>>>>>>> MAIN PROGRAM <<<<<<<<<<                     ##
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+if ($argc != 2) 
+{
+  echo "Usage: $argv[0] <exam_config_file>\n\n";
+  echo "  <exam_config_file> : Configuration file detailing what to collect from what\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+
+################################################################################
+# Store exam details in global variable $exam_details                          #
+################################################################################
+$exam_details = parse_ini_file($exam_config_file, true);
+
+################################################################################
+# Ask user for a "group" name, stored globally                                 #
+################################################################################
+$group_name = GetGroupName();
+
+$collect_dir = CollectBaseDir($cisco_configs, $exam_details) . "/$group_name";
+echo $collect_dir;
+if (!file_exists($collect_dir)) mkdir($collect_dir, 0777, $recursive=TRUE);
+
+################################################################################
+# COLLECTION STAGE                                                             #
+#                                                                              #
+# This step is non-optional, if not configured in the exam configuration then  #
+# terminate.                                                                   #
+# The command to execute is based on the "data_source" config option, the      #
+# command always take two parameters, the exam configuration file and the group#
+# name                                                                         #
+# If collection fails, we terminate with an error message                      #
+################################################################################
+if (!in_array("Collect", array_keys($exam_details)))
+{
+  echo "\033[1;31;40mERROR:\033[0;37;40m Missing collection information in ($exam_config_file)\n\n";
+  exit(1);
+}
+
+echo "\n\033[1;36;40mCollecting Student Device Configurations\033[0;37;40m...\n";
+$exec_command = "{$cisco_configs["bin_path"]}/{$exam_details["Collect"]["data_source"]}_$collection_script $exam_config_file $group_name";
+
+passthru($exec_command, $result);
+if ($result != 0)
+{
+  echo " \033[1;36;40mExam terminated prematurily\033[0;37;40m\n";
+  exit(1);
+}
+
+################################################################################
+# POST COLLECTION WORK                                                         #
+#                                                                              #
+# - Loop through the provided stages in order of processing                    #
+# - For each stage, loop through all provided modules.                         #
+#   o Split module into program name and section name in exam config file      #
+#   o If the section name exists, execute the module/program with standard     #
+#     parameters (config file name + group name)                               #
+#   o If the module fails, abort this program/collection                       #
+################################################################################
+foreach (explode(",", $cisco_configs["stages"]) as $stages)
+{
+  foreach ($cisco_configs[$stages] as $program => $config)
+  {
+    if (in_array($config, array_keys($exam_details)))
+    {
+      passthru("{$cisco_configs["bin_path"]}/$program $exam_config_file $group_name", $result);
+      if ($result != 0)
+      {
+        echo " \033[1;36;40mExam terminated prematurily\033[0;37;40m\n";
+        exit(1);
+      }
+    }
+  }
+}
+
+?>

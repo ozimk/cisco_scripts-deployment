@@ -1,0 +1,186 @@
+!Skills Exam Router R1 Error Config
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+!
+hostname R1
+!
+logging buffered 16384
+enable secret cisco
+!
+aaa new-model
+!
+!
+aaa authentication login default local
+aaa authentication login CONSOLE none
+aaa authorization exec default local 
+!
+!
+clock timezone AEST +10
+clock summer-time AEDT recurring
+do clock set 09:00:00 Jun 01 2018
+!
+!
+no ip domain lookup
+ip domain name tshoot.net
+ipv6 unicast-routing
+!
+username cisco secret cisco
+!
+!
+ip telnet source-interface Loopback0
+ip ssh source-interface Loopback0
+ip ssh dh min size 2048
+! 
+!
+interface Loopback0
+ description BGP Peer
+ ip address 192.168.1.1 255.255.255.255
+ ip ospf network point-to-point
+ ipv6 enable
+ ipv6 address FE80::1 link-local
+ ipv6 address 2001:DB8:FEED:201::1/128
+ ipv6 ospf 2 area 0
+ ipv6 ospf network point-to-point
+!
+!
+interface GigabitEthernet0/0/0
+ no ip address
+ shutdown
+!
+interface GigabitEthernet0/0/1
+ description FE to DLS1
+ ip address 10.1.2.2 255.255.255.252
+ no negotiation auto
+ speed 1000
+ duplex full
+ ip nat inside
+ ipv6 enable
+ ipv6 address FE80::1 link-local
+ ipv6 address 2001:DB8:CAFE:20::1/64
+ ipv6 ospf 2 area 0
+ no shutdown
+!
+interface Serial0/1/0
+ description WAN link to R2: 2 Mbps leased line 
+ ip address 209.165.200.225 255.255.255.252
+ ip nat outside
+ encapsulation ppp
+ ipv6 enable
+ ipv6 address FE80::1 link-local
+ ipv6 address 2001:DB8:FEED::1/126
+ clock rate 2000000
+ no shutdown
+!
+interface Serial0/1/1
+ description WAN link to R3 (not used)
+ no ip address
+ shutdown
+!
+router bgp 65501
+ bgp router-id 11.0.0.11
+ bgp log-neighbor-changes
+ neighbor 2001:DB8:FEED:202::2 remote-as 65502
+ neighbor 2001:DB8:FEED:202::2 ebgp-multihop 2
+ neighbor 2001:DB8:FEED:202::2 update-source Loopback0
+ !
+ address-family ipv4
+  neighbor 2001:DB8:FEED:202::2 activate
+  neighbor 2001:DB8:FEED:202::2 route-map IPv6TransportIPv4Route in
+ exit-address-family
+ !
+ address-family ipv6
+  neighbor 2001:DB8:FEED:202::2 activate
+ exit-address-family
+!
+!
+router ospf 1
+ router-id 1.0.0.1
+ redistribute bgp 65501 metric 100 metric-type 1
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+ network 10.1.2.0 0.0.0.3 area 0
+ network 192.168.1.1 0.0.0.0 area 0
+ default-information originate metric 100 metric-type 1
+!
+!
+ipv6 router ospf 2
+ router-id 11.0.0.11
+ redistribute bgp 65501 route-map IPv6METRIC
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+ default-information originate metric 100 metric-type 1
+!
+!
+ipv6 route 2001:DB8:FEED:202::2/128 2001:DB8:FEED::2
+ipv6 route 2001:DB8:CAFE::/48 Null0
+!
+route-map IPv6METRIC permit 10
+ set metric 100
+ set metric-type type-1
+!
+!
+ip route 192.168.2.1 255.255.255.255 209.165.200.226
+!
+route-map IPv6TransportIPv4Route permit 10
+ set ip next-hop 192.168.2.1
+!
+ip nat pool public-addrs 198.133.219.5 198.133.219.30 netmask 255.255.255.224
+ip nat inside source list 1 pool public-addrs overload
+ip nat inside source static 10.1.100.1 198.133.219.1
+!
+access-list 1 permit 1.10.0.0 0.0.255.255
+!
+!
+crypto key gen rsa general-keys modulus 1024
+!
+!
+ip http server
+ip http secure-server
+!
+!
+logging source-interface Loopback0
+logging host 10.1.100.1
+!
+!           
+snmp-server community cisco RO
+snmp-server community san-fran RW
+snmp-server trap-source Loopback0
+snmp-server location TSHOOT Lab Facility
+snmp-server contact support@tshoot.net
+snmp-server enable traps eigrp
+snmp-server enable traps flash insertion
+snmp-server enable traps flash removal
+snmp-server enable traps config
+snmp-server enable traps cpu threshold
+snmp-server host 10.1.100.1 version 2c cisco 
+!
+!
+banner motd ^*** Skills Exam Router R1 Error Config Set A ***^
+!
+line con 0
+ exec-timeout 0 0
+ logging synchronous
+ login authentication CONSOLE
+!
+line vty 0 4
+ exec-timeout 0 0
+ logging synchronous
+ transport input ssh
+!
+ntp source Loopback0
+ntp server 192.168.1.2
+!
+archive
+ log config
+  logging enable
+  logging size 50
+  notify syslog contenttype plaintext
+  hidekeys
+ path tftp://10.1.100.1/$h-archive-config
+ write-memory
+file prompt quiet
+!
+end
+!

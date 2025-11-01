@@ -1,0 +1,125 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Actual scripts that perform the marking, both checking of configurations for #
+# errors and assessment of errors to obtain a result                           #
+################################################################################
+$check_configs_command = "{$cisco_configs["bin_path"]}/check_collected_configs";
+
+$assess_errors_command = "{$cisco_configs["bin_path"]}/assess_collected_errors";
+
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+if (($argc != 3) and ($argc != 4))
+{
+  echo "Usage: $argv[0] <exam_config_file> <group_name> [student_id]\n";
+  echo "
+  <exam_config_file> : Configuration file detailing what to collect from what
+  <group_name>       : Name of group where configurations to mark are stored
+  [student_id]       : (Optional) Mark single student only in group, implies verbose output\n";
+
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$group_name = $argv[2];
+$verbose = ($argc === 4);
+
+################################################################################
+# Get exam configuration details to determines "where" student configs are     #
+################################################################################
+if (($exam_details = parse_ini_file($exam_config_file, true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading exam_config_file ($exam_config_file)\n";
+  exit(1);
+}
+$collect_dir = CollectBaseDir($cisco_configs, $exam_details) . "/$group_name";
+
+################################################################################
+# Get list of student IDs that were collected                                  #
+# - If marking a single student, list consists of provided student ID          #
+################################################################################
+$student_ids = ($verbose)?(array($argv[3])):(array_map("basename", glob("$collect_dir/*", GLOB_ONLYDIR)));
+
+################################################################################
+# Initialise variables to store progress through marking                       #
+################################################################################
+$rows = round(count($student_ids) / 2);
+$number_assessed = 0;
+$pass_count = 0;
+$fail_count = 0;
+$pass_rate = 0;
+$fail_rate = 0;
+
+################################################################################
+# Mark all students, for each student to collect                               #
+# - If we are marking a group, display the progress to the user                #
+# - Mark the config <MarkExam()>. The last parameter determines whether the    #
+#   output is verbose (single student) or not (group)                          #
+# - Store the result (student ID and string) in the appropriate row of the     #
+#   $results array                                                             #
+# - Update the number of students assessed, the current pass and fail counts,  #
+#   and the current pass and fail rates                                        #
+################################################################################
+$pass_fail_rates["Pass:"] = "-0";
+$pass_fail_rates["Fail:"] = "-0";
+foreach ($student_ids as $student_id)
+{
+//  if ($argc == 3) display_progress(100 * $number_assessed / count($student_ids), "Marking $student_id...\n\n Passes:\t $pass_count ($pass_rate%)\n Fails:\t $fail_count ($fail_rate%)");
+  if (!($verbose)) DisplayProgress("Marking Exams", round(100 * $number_assessed / count($student_ids)), "Marking $student_id...\n", $pass_fail_rates, $exam_details["Exam Details"]["name"], '--no-collapse');
+
+  if (!($verbose)) ob_start();
+
+  passthru("$check_configs_command $exam_config_file $collect_dir/$student_id", $result);
+if ($result !== 0)
+{
+echo "FAILED THE CHECK PROGRAM\n";
+var_dump($result);
+  sleep(5);
+}
+
+  passthru("$assess_errors_command $exam_config_file $collect_dir/$student_id", $result);
+
+  if (!($verbose)) ob_end_clean();
+
+  $results[($number_assessed % $rows)] .= str_pad("$student_id" . (($result === 0)?("\Zb\Z1"):("\Zb\Z2")) . " $result\Zn", 25);
+
+  $number_assessed++;
+
+  if ($result === 0) $fail_count++; else $pass_count++;
+
+  $pass_rate = round(100 * $pass_count / $number_assessed);
+  $fail_rate = round(100 * $fail_count / $number_assessed);
+  $pass_fail_rates["Pass:"] = "-" . round(100 * $pass_count / $number_assessed);
+  $pass_fail_rates["Fail:"] = "-" . round(100 * $fail_count / $number_assessed);
+}
+
+################################################################################
+# If marking a single student, we are finished                                 #
+################################################################################
+if ($verbose) exit(0);
+
+################################################################################
+# Display a summary of results before terminating                              #
+################################################################################
+$result_message = "\nPasses:  $pass_count ($pass_rate%)    Fails:  $fail_count ($fail_rate%)\n\n" . implode("\n", $results);
+
+DisplayMessage("Exam Results", $result_message, $exam_details["Exam Details"]["name"], '--no-collapse');
+
+?>

@@ -1,0 +1,132 @@
+#!/usr/bin/php -f
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/acl_parser.php");
+
+################################################################################
+# Load the contents of file and return the ACL instance of the rules within    #
+# the file                                                                     #
+################################################################################
+function load_acl_file($filename, $description)
+{
+  if (!file_exists($filename)) 
+  {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m ACL Rule File ($acl_rule_file) does not exist\n";
+    exit(1);
+  }
+
+  echo "\033[1;32;40mParsing $description:\033[0;37;40m\t$filename\n";
+
+  $acl_commands = explode("\n", file_get_contents($filename));
+  
+  $new_ACL = new ACL('extended');
+  if ($filename == 'prune_solution') $new_ACL->set_any_equiv('src', "192.168.0.0/24");
+
+  foreach ($acl_commands as $command)
+    if (strlen(trim($command)) > 0) $new_ACL->add_statement($command);
+
+  $new_ACL->finalise();
+
+  return $new_ACL;
+}
+
+################################################################################
+##                     >>>>>>>>>> MAIN PROGRAM <<<<<<<<<<                     ##
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+$ACL_solution = NULL;
+
+switch ($argc)
+{
+  case 2:  $ACL_solution = new ACL("Extended");
+           $ACL_solution->finalise();
+           $ACL_check    = load_acl_file($argv[1], "Sample ACL file");
+           break;
+  case 3:  $ACL_solution = load_acl_file($argv[1], "Solution ACL file");
+           $ACL_check    = load_acl_file($argv[2], "Sample ACL file");
+           break;
+  default: echo "Usage: $argv[0] <acl_rule_file> [<compare_file>]\n\n";
+           echo "  <acl_rule_file> : Text file containing a list of ACL rules\n";
+           echo "  <compare_file>  : (optional) Text file containing a list of ACL rules\n";
+           echo "                    If specified the ACL in this files will be \"marked\" against the sample solution in <acl_rule_file>\n";
+           exit(1);
+}
+
+#########################################################################################################
+## ACL_solution contains the solution to mark against, empty rule list if only one file is specified   ##
+## ACL_check contains the ACL to parse and comment on                                                  ##
+## Lets mark the ACL to get any problems                                                               ##
+#########################################################################################################
+$ACL_check->print_acl(); 
+$results = $ACL_check->mark_acl($ACL_solution);
+
+#########################################################################################################
+## Start by displaying the details of the ACL we are checking, the actual and effective statements     ##
+#########################################################################################################
+echo "\n\033[1;32;40mSolution ACL Rules as provided:\033[0;37;40m\n";
+foreach ($ACL_solution->raw_statements as $rule) echo "  $rule\n";
+
+echo "\n\033[1;32;40mEffective non-overlapped Solution ACL Rules:\033[0;37;40m\n";
+$ACL_solution->print_acl();
+
+echo "\n\033[1;32;40mACL Rules as provided:\033[0;37;40m\n";
+foreach ($ACL_check->raw_statements as $rule) echo "  $rule\n";
+
+echo "\n\033[1;32;40mEffective non-overlapped ACL Rules:\033[0;37;40m\n";
+$ACL_check->print_acl();
+
+echo "\n";
+
+#########################################################################################################
+## We are marking against a provided solution, so there is relevant information in checking for a      ##
+## valid solution and whether it is an optimum solution                                                ##
+#########################################################################################################
+if ($argc === 3)
+{
+  echo "\033[1;32;40mDoes ACL rule equal solution:\033[0;37;40m\t\t" . (($results['same'])?"Yes\n":"No - \033[1;31;40mMAJOR ERROR\033[0;37;40m\n");
+
+  if ($results['same'] && $results['not_optimal'])
+    echo "\n\033[1;31;40mMINOR ERROR\033[0;37;40m - {$results['not_optimal_message']}\n";
+
+  echo "\n";
+}
+
+#########################################################################################################
+## The following minor errors can be detected whether we have a sample solution or not                 ##
+#########################################################################################################
+if ($results['pointless_rules'])
+{
+  echo "\033[1;31;40mMINOR ERROR\033[0;37;40m - The following rules will never match any packets as they are matched by previous rule(s) in the ACL:\n";
+  foreach ($results['pointless_rules_list'] as $rule) echo "  $rule\n";
+  echo "\n";
+}
+
+if ($results['pointless_post_default'])
+{
+  echo "\033[1;31;40mMINOR ERROR\033[0;37;40m - The following rules will never match any packets as they are listed after the \"permit|deny ip any any\" rule in the ACL:\n";
+  foreach ($results['pointless_post_default_list'] as $rule) echo "  $rule\n";
+  echo "\n";
+}
+
+if ($results['not_optimal_prune'])
+{
+  echo "\033[1;31;40mMINOR ERROR\033[0;37;40m - At least one ACL rule contains a source or destination IP ranges that is wholy or partially outside the range of addresses equivalent to \"any\"\n";
+  foreach ($results['unclean_prune_summary'] as $rule) echo "  $rule\n";
+  echo "\n";
+}
+
+?>
+

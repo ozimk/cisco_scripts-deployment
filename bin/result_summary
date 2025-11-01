@@ -1,0 +1,39 @@
+#!/bin/bash
+
+## Need to have at least one command line parameter
+if [ $# -ne 1 ]; then
+    echo "ERROR: No exam directory provided"
+    echo 
+    echo "Usage: $0 <exam_directory>"
+    echo
+    echo "Example:"
+    echo
+    echo "    ${0} 2019_S2/midsem"
+    exit 1
+fi
+
+# Set the exam directory
+BASE_DIR=${1}
+
+PASS_COUNT=`grep passed ${BASE_DIR}/*/*/results.major_minor | wc -l`
+FAIL_COUNT=`grep failing ${BASE_DIR}/*/*/results.major_minor | wc -l`
+OFFER_50_COUNT=`grep ORIGINALLY ${BASE_DIR}/*/*/results.major_minor | wc -l`
+RESIT_COUNT=`echo "(${FAIL_COUNT} - ${OFFER_50_COUNT})" | bc`
+TOTAL_COUNT=`echo "(${PASS_COUNT} + ${FAIL_COUNT})" | bc`
+
+PASS_RATE=`echo "scale=2; 100 * ${PASS_COUNT} / (${TOTAL_COUNT})" | bc`
+FAIL_RATE=`echo "scale=2; 100 * ${FAIL_COUNT} / (${TOTAL_COUNT})" | bc`
+OFFER_50_RATE=`echo "scale=2; 100 * ${OFFER_50_COUNT} / (${TOTAL_COUNT})" | bc`
+
+RESIT_RATE=`echo "scale=2; 100 * (${FAIL_COUNT} - ${OFFER_50_COUNT}) / (${TOTAL_COUNT})" | bc`
+
+echo -e "Skills Exam Result Summary for ${BASE_DIR}"
+echo -e "-----------------------------------------------------------------------"
+echo -e "Total Exams: ${TOTAL_COUNT}"
+echo -e "Pass:        ${PASS_COUNT} (${PASS_RATE}%)"
+echo -e "Offer 50:    ${OFFER_50_COUNT} (${OFFER_50_RATE}%)"
+echo -e "Fail:        ${FAIL_COUNT} (${FAIL_RATE}%)"
+echo -e
+echo -e "Resit(Fail - Offer50): ${RESIT_COUNT} (${RESIT_RATE}%)"
+echo -e "-----------------------------------------------------------------------"
+

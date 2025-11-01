@@ -1,0 +1,107 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Include libraries to access a device via ssh(Swinburne ATC lab setup).       #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/consolessh.php");
+
+################################################################################
+# Include libraries to talk to and capture stuff from a device (password       #
+# support is still crap                                                        #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/devicecontrol.php");
+
+################################################################################
+# ChildProcess_UploadDevice($device_name)                                      #
+#                                                                              #
+# This function uploads the provided configurarion commands to the specified   #
+# device.                                                                      #
+#                                                                              #
+# - Connect to the device and try to go to enable mode. If we fail, terminate  #
+#   with failure.  The main loop will retry later on. As this function will    #
+#   run in a child process, we exit the process with failure                   #
+# - We are now in enable mode                                                  #
+# - Send the "conf t" command to go into configuration mode                    #
+# - Loop through each of the provided commands, sending them to the device one #
+#   at a time                                                                  #
+# - Go back to enable mode. We could send the actual commands, but it is safer #
+#   to use the pre-provided function                                           #
+# - Execute "copy run start" to save the configuration                         #
+# - Exit the child process with a success code                                 #
+################################################################################
+function WipeDevice($ssh_info, $device_type, $device_model)
+{
+  $return_code = 0;
+
+  // Create classes to connect and talk to the devices
+  $ssh = new ConsoleSSH();
+  $console = new DeviceControl($ssh);
+
+  // Connect to the device and go to enable mode. If unsuccessful, terminate with failure
+  if (($ssh->Connect($ssh_info)) === false) { $return_code = 1; goto terminate; };
+
+  if ($console->GoEnable(false) === false) { $return_code = 1; goto terminate; }
+
+  if($device_model === "3650") $console->Reset3650Switch(); 
+  else if ($device_type === "switch") $console->ResetSwitch();
+  else if ($device_type === "router") $console->ResetRouter();
+
+terminate:
+  // Pause for a bit, seems to help ensure that everything terminates cleanly without pending commands
+  sleep(5);
+  $ssh->Disconnect();
+  sleep(2);
+  return $return_code;
+}
+
+################################################################################
+# MAIN PROGRAM                                                                 #
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+// Check command line parameters
+if ($argc != 7)
+{
+  echo "Usage: $argv[0] <uri> <username> <password> <nickname> switch|router <model>\n";
+  echo "
+  <uri>                : IP Address or DNS name of URI to connect to device
+  <username>           : Username to use to form ssh connection to device for upload
+  <password>           : Password to use to form ssh connection to device for upload
+  <nickname>           : Nickname of device for display purposes
+  switch|router        : Specify type of device to wipe clean
+  model                : The Model of the switch or router\n";
+  
+  exit(1);
+}
+
+// Do we need to save the configuration?
+$device_type = $argv[5];
+
+var_dump($device_type);
+// Get list of commands to run on devices
+if (($device_type !== "switch") and ($device_type !== "router"))
+{
+  echo "ERROR: Unable to determine type of device to wipe - " . $argv[5] . "\n";
+//  DisplayMessage(" ERROR Loading File ", "Unable to load contents from provided filename \"" . $argv[5] . "\"");
+  exit(1);
+}
+
+// Upload device configuration and exit with outcome of process
+exit(WipeDevice(array("server" => $argv[1], "username" => $argv[2], "password" => $argv[3], "nickname" => $argv[4]), $device_type, $argv[6]));
+
+?>

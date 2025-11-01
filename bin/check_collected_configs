@@ -1,0 +1,619 @@
+#!/usr/bin/php -f
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+##########
+# Libraries used to help mark exams
+##########
+require_once("{$cisco_configs["lib_path"]}/log_errors.php");
+require_once("{$cisco_configs["lib_path"]}/routerconfig.php");
+require_once("{$cisco_configs["lib_path"]}/switchconfig.php");
+require_once("{$cisco_configs["lib_path"]}/basicdevice_checks.php");
+require_once("{$cisco_configs["lib_path"]}/staticroute_checks.php");
+require_once("{$cisco_configs["lib_path"]}/layer2_checks.php");
+require_once("{$cisco_configs["lib_path"]}/spanningtree_checks.php");
+require_once("{$cisco_configs["lib_path"]}/layer3_checks.php");
+require_once("{$cisco_configs["lib_path"]}/service_checks.php");
+require_once("{$cisco_configs["lib_path"]}/acl_checks.php");
+require_once("{$cisco_configs["lib_path"]}/routingprotocol_checks.php");
+
+$errors = Array();
+
+##########
+# Help for pretty output
+##########
+function print_colour($colour, $text)
+{
+  if($colour == "")           echo "\033[0;37;40m";
+  else if($colour == "red")   echo "\033[7;31;40m";
+  else if($colour == "pink")  echo "\033[1;31;40m";
+  else if($colour == "green") echo "\033[7;32;40m";
+  else if($colour == "brown") echo "\033[7;33;40m";
+  else if($colour == "cyan")  echo "\033[1;36;40m";
+  echo "$text\033[0;37;40m";
+}
+
+#########################################################################
+# LOAD SAVED EXAM OPTIONS                                               #
+#########################################################################
+# Load any exam optional parameters                                     #
+# - If there aren't any options in this exam return NULL                #
+# - If the saved option file doesn't exist, fail with an error          #
+# - Parse the saved option file into $exam_options                      #
+# - Create a new exam option 'description' for logging purposes         #
+#   o Append each option description and value to this logging string   #
+# - Return the options array                                            #
+#########################################################################
+function LoadExamOptions($option_file)
+{
+  global $exam_details;
+
+  if ((!in_array("Exam Options", array_keys($exam_details))) || (count($exam_details["Exam Options"]) == 0)) return NULL;
+
+  echo "\n  Loading saved exam options...\t";
+  if (!file_exists($option_file)) 
+  {
+    echo "\n\033[1;31;40mERROR: \033[0;37;40m Exam options file ($option_file) does not exist\n";
+    exit(1);
+  }
+
+  $exam_options = parse_ini_file($option_file, true);
+
+  foreach ($exam_details["Exam Options"] as $variable => $information) print_colour('cyan', "\t$variable({$exam_options['Student Options'][$variable]})");
+
+  echo "\n";
+  return $exam_options['Student Options'];
+}
+
+#########################################################################
+# SET THE SOLUTION FROM LOADED EXAM DETAILS                             #
+#########################################################################
+# The loaded exam details INI file contains information about the exam  #
+# solution. Process that into a variable ($solution) and return to the  #
+# caller                                                                #
+#                                                                       #
+# Loop through each variable in the [Marking] section of INI file       #
+# - Ignore some variables                                               #
+# - Check if variable is in form "option_value_variable"                #
+#   o If so and option exists in $exam_options but value is not for     #
+#     this exam, continue to next variable in INI file                  #
+#   o If so and option exists in $exam_options and value is for this    #
+#     exam, change $variable to last piece of original $variable (strip #
+#     "option_value_" portion                                           #
+# - Loop through each entry of $variable (multiple lines in INI file    #
+#   with same name but different array [] portion)                      #
+#   o Value is typically a comma separated list, break this list into   #
+#     individual elements                                               #
+#   o For each element in list:                                         #
+#     - Process element depending on value of $variable, see in-code    #
+#       comments for more information                                   #
+# Loop through all device configurations in the solution                #
+# - Loop through each data block in the device configuration            #
+#   o If the block is a layer2 or layer3 information block, loop        #
+#     through all interfaces                                            #
+#     - If the interface has a "link" field, create the corresponding   #
+#       link details in $solutions['link'] for later checking of links  #
+#########################################################################
+function SetSolution()
+{
+  global $exam_details, $exam_options;
+
+  echo "\n  Loading exam solution parameters...\n";
+
+  // Loop through variables in Marking section of INI file
+  foreach ($exam_details["Marking"] as $variable => $value)
+  {
+    // Ignore some settings, nothing to do with the solution/marking
+    if ($variable == "rubric") continue;
+
+    // Check if $variable is derived from an exam option, if so, ignore a non-selected option and reset the variable name
+    $sub_variable = explode('_', $variable, 3);
+    if ((count($sub_variable) > 2) and (in_array($sub_variable[0], array_keys($exam_options))))
+    {
+      if ($sub_variable[1] !== $exam_options[$sub_variable[0]]) continue;
+      $variable = $sub_variable[2];
+      print_colour('cyan', "    " . str_pad("$variable({$sub_variable[1]})", 18));
+    } else
+      print_colour('cyan', "    " . str_pad($variable, 18));
+
+    // Processing   >>>   $variable[$index] = $details
+    foreach ($value as $index => $details)
+    {
+      echo "\t$index";
+
+      // acl config is special, no sublist of variables, only a list of rules
+      if ($variable === 'acl')
+      {
+        list($device, $placement) = explode(":", $index, 2);
+        $solution['devices'][$device][$variable][$placement] = explode(",", $details);
+        // Finished parsing this $details
+        continue;
+      }
+
+      // Break $details into variable names and values
+      $param_count = preg_match_all('/(\w+):([^,]*)/', $details, $params);
+      if ($variable === "acl") {var_dump($details); var_dump($params); var_dump($param_count);}
+      for($i = 0; $i < $param_count; $i++)
+      {
+        switch ($variable)
+        {
+          case "basic_config":  
+                                $devices = explode(':', $index);
+                                foreach ($devices as $device)
+                                {
+                                  if ($params[1][$i] === "static_routes")
+                                  {
+                                    $solution['devices'][$device][$variable][$params[1][$i]] = array();
+                                    foreach (explode('::', $params[2][$i]) as $route_details) $solution['devices'][$device][$variable][$params[1][$i]][] = explode(':', $route_details);
+                                  } else
+                                    $solution['devices'][$device][$variable][$params[1][$i]] = ($params[2][$i] == "true")?true:(($params[2][$i] == "false")?false:$params[2][$i]);
+                                }
+                                break;
+
+          // Parameter provided as foo[device:interface] = comma separated list of "variable:value"
+          // layer2, layer3 - Interface information for layer 2 or layer 3
+          case "layer2":        list($device, $interface_range) = explode(":", $index);
+                                $interfaces = explode('-', $interface_range);
+                                $interface_base = (strpos($interfaces[0], "/") !== false)?(substr($interfaces[0], 0, strrpos($interfaces[0], "/") + 1)):(substr($interfaces[0], 0, strlen($interfaces[0]) - 1));
+                                $low_num = substr($interfaces[0], strlen($interface_base));
+                                $high_num = (isset($interfaces[1]))?($interfaces[1]):($low_num);
+                                foreach (range($low_num, $high_num) as $num)
+                                  $solution['devices'][$device][$variable]["$interface_base$num"][$params[1][$i]] = ($params[2][$i] == "true")?true:(($params[2][$i] == "false")?false:$params[2][$i]);
+                                break;
+          case "layer3":        list($device, $interface) = explode(":", $index);
+                                $solution['devices'][$device][$variable]["$interface"][$params[1][$i]] = ($params[2][$i] == "true")?true:(($params[2][$i] == "false")?false:$params[2][$i]);
+                                break;
+
+          // Parameter provides as   foo[device] = comma separated list of "variable:value"
+          // vlans - VLAN configuration on a switch
+          case "vlans":         $devices = explode(':', $index);
+                                foreach ($devices as $device) $solution['devices'][$device][$variable][$params[1][$i]] = $params[2][$i];
+                                break;
+
+          // Parameter provided as foo[sub_info] = comma separated list of "variable:value"
+          // stp - STP configuration for a set of switches (sub_info = device list "device:device:device")
+          case "stp":           $solution[$variable][$index][$params[1][$i]] = $params[2][$i];
+                                break;
+
+          case "nat":           switch ($params[1][$i])
+                                {
+                                  case "interfaces":   foreach (explode('::', $params[2][$i]) as $iface_lists) 
+                                                       {
+                                                         list($direction, $interfaces) = explode(':', $iface_lists, 2);
+                                                         $interfaces = array_values(explode(':', $interfaces));
+                                                         $solution['devices'][$index][$variable][$params[1][$i]][$direction] = $interfaces;
+                                                       }
+                                                       break;
+                                  case "overload":     $solution['devices'][$index][$variable][$params[1][$i]] = ($params[2][$i] === 'true')?true:false;
+                                                       break;
+                                  default:             $solution['devices'][$index][$variable][$params[1][$i]] = explode(':', $params[2][$i]);
+                                                       break;
+
+                                }
+                                break;
+
+          case "dhcp":          list($device, $network) = explode(":", $index);
+                                if ($params[1][$i] === 'excluded')
+                                {
+                                  $excluded = array();
+                                  foreach (explode(':', $params[2][$i]) as $excluded_range)
+                                  {
+                                    $range = explode('-', $excluded_range);
+                                    $low_IP = $range[0];
+                                    $high_IP = (isset($range[1]))?(substr($low_IP, 0, strrpos($low_IP, ".")) . '.' . $range[1]):($low_IP);
+
+                                    $excluded = array_merge($excluded, array_map('long2ip', range(ip2long($low_IP), ip2long($high_IP))));
+                                  }
+                                  $solution['devices'][$device][$variable][$network][$params[1][$i]] = $excluded;
+                                } else
+                                  $solution['devices'][$device][$variable][$network][$params[1][$i]] = $params[2][$i];
+                                break;
+
+          case "routing_irp":   if (!array_key_exists('routing_irp', $solution)) $solution['routing_irp'] = array();
+                                if (!array_key_exists($index, $solution['routing_irp'])) $solution['routing_irp'][$index] = array();
+// $index = ospf or eigrp
+// $params[1][$i] = sub-parameter name
+// $params[2][$i] = sub-parameter value
+// SHOULD WE STORE NON OSPF AS AREA 0/BASE REGARDLESS???
+                                switch ($params[1][$i])
+                                {
+                                  case "advertise":    $area_name = 'base';
+                                                       $area_number = '0';
+                                                       foreach (explode('::', $params[2][$i]) as $device_advertisements) 
+                                                       {
+                                                         list($device, $interfaces) = explode(':', $device_advertisements, 2);
+                                                         $interfaces = explode(':', $interfaces);
+
+                                                         if ($device === 'area')
+                                                         {
+                                                           $area_name = $interfaces[0];
+                                                           $area_number = $interfaces[1];
+                                                         } else
+                                                         {
+                                                           if (!array_key_exists($params[1][$i], $solution['routing_irp'][$index]))
+                                                             $solution['routing_irp'][$index][$params[1][$i]] = array();
+                                                           if (!array_key_exists($device, $solution['routing_irp'][$index][$params[1][$i]]))
+                                                             $solution['routing_irp'][$index][$params[1][$i]][$device] = array();
+                                                           $solution['routing_irp'][$index][$params[1][$i]][$device] = array_merge($solution['routing_irp'][$index][$params[1][$i]][$device], $interfaces);
+
+                                                           if ($index === 'ospf')
+                                                           {
+                                                             $solution['routing_irp'][$index]['areas'][$area_name]['number'] = $area_number;
+                                                             if (!array_key_exists($params[1][$i], $solution['routing_irp'][$index]['areas'][$area_name]))
+                                                               $solution['routing_irp'][$index]['areas'][$area_name][$params[1][$i]] = array();
+                                                             if (!array_key_exists($device, $solution['routing_irp'][$index]['areas'][$area_name][$params[1][$i]]))
+                                                               $solution['routing_irp'][$index]['areas'][$area_name][$params[1][$i]][$device] = array();
+                                                             $solution['routing_irp'][$index]['areas'][$area_name][$params[1][$i]][$device] = array_merge($solution['routing_irp'][$index]['areas'][$area_name][$params[1][$i]][$device], $interfaces);
+                                                           }
+                                                         }
+                                                       }
+                                                       break;
+                                  case "redistribute": $solution['routing_irp'][$index][$params[1][$i]] = explode(':', $params[2][$i]);
+                                                       break;
+                                  default:             $solution['routing_irp'][$index][$params[1][$i]] = ($params[2][$i] == "true")?true:(($params[2][$i] == "false")?false:$params[2][$i]);
+                                                       break;
+                                }
+                                break;
+
+          // A parameter type we do not understand
+          default:              echo "ERROR: Unknown parameter ($variable)\n"; var_dump($sub_variable);
+                                die;
+        }
+      }
+    }
+    echo "\n";
+  }
+
+  // Find Links
+  // Search through all layer2 and layer3 interfaces, if we detect a link, create a $solution['links']['layer2'|'layer3'] to store the link information (including this interface)
+  // Also if the first interface on the link is a routing protocol advertised interface, create $solution['routing_irp'][<protocol>]['links'] array to store the links for checking
+  foreach ($solution['devices'] as $device_name => $device_solution)
+  {
+    foreach ($device_solution as $info_type => $data)
+    {
+      switch ($info_type)
+      {
+        case 'layer2':
+        case 'layer3': foreach ($data as $interface_name => $details)
+                         if (isset($details['link']))
+                         {
+                           $temp = Array(Array($device_name, $interface_name));
+                           foreach (explode('::', $details['link']) as $end_point) $temp[] = explode(':', $end_point);
+                           $solution['links'][$info_type][] = $temp;
+
+                           if (array_key_exists('routing_irp', $solution))
+                             foreach (array_keys($solution['routing_irp']) as $protocol)
+                               if ((array_key_exists($temp[0][0], $solution['routing_irp'][$protocol]['advertise'])) and (in_array($temp[0][1], $solution['routing_irp'][$protocol]['advertise'][$temp[0][0]])))
+                                 $solution['routing_irp'][$protocol]['links'][] = $temp;
+
+                         }
+                       break;
+        default:       break;
+      }
+    }
+  }
+//var_dump($solution);
+  return $solution;
+}
+
+#########################################################################
+# LOAD SAVED DEVICE CONFIGURATIONS                                      #
+#########################################################################
+# Loads stored device configurations, parses them and generates the     #
+# configuration database. Inputs are:                                   #
+#  $collect_dir - Base directory of student collected work              #
+#                                                                       #
+# For all devices in the exam, determine the device storage directory   #
+# and create an instance of RouterConfig or SwitchConfig (based on the  #
+# device type) from the stored files. Print status as it runs.          #
+# The device database is stored in the global array as:                 #
+#      $config[<device_name>]                                           #
+#########################################################################
+function LoadDeviceConfigs($collect_dir)
+{
+  global $exam_details, $configs;
+
+  echo "\n  Loading saved device configs...";
+  foreach ($exam_details['Exam Details']['devices'] as $device_name)
+  {
+    switch ($exam_details[$device_name]['type'])
+    {
+      case 'R':  $configs[$device_name] = new RouterConfig("$collect_dir/$device_name");
+                 print_colour('cyan', "\t$device_name");
+                 break;
+      case 'S':  $configs[$device_name] = new SwitchConfig("$collect_dir/$device_name");
+                 print_colour('cyan', "\t$device_name");
+                 break;
+      default:   print_colour('pink', "\t$device_name");
+    }
+  }
+  echo "\n";
+}
+
+################################################################################
+##                         >>>>>   MARK EXAM   <<<<<                          ##
+################################################################################
+
+################################################################################
+# PER DEVICE CONFIGURATION                                                     #
+################################################################################
+# For each device we have a configuration for:                                 #
+# - Call check_device_basicconfig() to check generic configuration             #
+# - Call check_routes_static() to check static/default routes                  #
+# - If the device is a switch:                                                 #
+#   o Call check_layer2ports() to check layer2 configuration                   #
+#   o Call check_layer2vlans() to check vlan configuration                     #
+# - Call check_layer3_interfaces() to check layer3 configuration               #
+# - Call check_service_dhcp() to check DHCP configuration                      #
+################################################################################
+function mark_devices()
+{
+  global $configs, $solution;
+
+  print_colour('cyan', "\tdevices");
+  foreach ($configs as $device_name => $device_config)
+  {
+    check_device_basicconfig($device_name, $device_config, $solution['devices'][$device_name]['basic_config']);
+    check_routes_static($device_name, ($device_config->device_type === "Switch"), $device_config, $solution['devices'][$device_name]['basic_config']);
+
+    if ($device_config->device_type === "Switch")
+    {
+      check_layer2ports($device_name, $device_config->interfaces, $solution['devices'][$device_name]['layer2']);
+      check_layer2vlans($device_name, $device_config->vlans, $solution['devices'][$device_name]['vlans']);
+    }
+
+    check_layer3_interfaces($device_name, ($device_config->device_type === "Switch"), $device_config->interfaces, $solution['devices'][$device_name]['layer3']);
+
+    check_acls($device_name, $device_config->ACLs, $solution['devices'][$device_name]['acl']);
+
+    check_service_dhcp($device_name, $device_config->dhcp, $solution['devices'][$device_name]['dhcp']);
+
+    check_service_nat($device_name, $device_config->nat_instances, $device_config->ACLs, $solution['devices'][$device_name]['nat']);
+  }
+}
+
+################################################################################
+# LINK CONFIGURATION                                                           #
+################################################################################
+# For each link we expect in the solution:                                     #
+# - Loop through each type of link (layer2/3)                                  #
+#   o Loop through each end-point in the link                                  #
+#     - Create an $interfaces array storing each end points config             #
+#     - Determine if the link is a serial link                                 #
+#     - Create a $link_ppp_config array containing basic PPP configuration for #
+#       each interface in the link                                             #
+#     - Create a $link_ppp_requirements array containing the PPP settings from #
+#       the configuration file                                                 #
+#   o Complete $link_ppp_config database by searching for passwords (CHAP),    #
+#     the remote device storing account information, and whether accounts are  #
+#     valid                                                                    #
+#   o Depending if it is a layer2/3 link, call the appropriate function        #
+#     (check_layer2_link() or check_layer3_link()) to check the exam           #
+#     configuration                                                            #
+################################################################################
+function mark_links()
+{
+  global $configs, $solution;
+
+  if (is_null($solution['links'])) return;
+
+  print_colour('cyan', "\tlinks");
+
+  foreach ($solution['links'] as $layer => $link_details)
+  {
+    foreach ($link_details as $link) 
+    {
+      unset($interfaces);
+      unset($link_ppp_config);
+      unset($link_ppp_requirements);
+
+      foreach ($link as $end_point)
+      {
+        $device = $end_point[0];
+        $interface = $end_point[1];
+        $description = "$device($interface)";
+        $interfaces[$description] = $configs[$device]->interfaces[$interface];
+        $serial = (strpos($interface_name, "Serial") === 0);
+        $user_details[$configs[$device]->hostname] = $configs[$device]->users;
+
+        // PPP has been configured on this interface, store PPP type, username and PPP password (for PAP) in $link_ppp_config
+        if ($interfaces[$description]->ppp_encapsulation)
+        {
+          $protocol = (isset($interfaces[$description]->ppp_authentication))?($interfaces[$description]->ppp_authentication):('null');
+          $link_ppp_config[$device]['protocol'] = $protocol;
+          $link_ppp_config[$device]['username'] = $interfaces[$description]->ppp_username;
+          if ($protocol === 'pap') $link_ppp_config[$device]['password'] = strtolower($interfaces[$description]->ppp_password);
+        }
+
+        // PPP is required as per the configuration file on this device, extract the PPP settings into $link_ppp_requirements
+        if ((is_null($link_ppp_requirements)) and (isset($solution['devices'][$device][$layer][$interface]['ppp'])))
+        {
+          foreach (explode('::', $solution['devices'][$device][$layer][$interface]['ppp']) as $ppp_setting)
+          {
+            list($option, $setting) = explode(':', $ppp_setting, 2);
+            $link_ppp_requirements[$option] = $setting;
+          }
+//        echo ">>>>>>> $device_info[0]\n";
+        }
+      }
+
+      // If at least one interface has PPP set
+      if (isset($link_ppp_config))
+        // Loop through each device with PPP configured on the appropriate interface
+        foreach ($link_ppp_config as $device => $settings)
+          // Loop through each device with PPP configured on the appropriate interface (again)
+          foreach ($link as $end_point)
+          {
+            $other_device = $end_point[0];
+
+            // Skip if two link end-points are equal
+            if ($device === $other_device) continue;
+
+            $link_ppp_config[$device]['remote_device'] = $other_device;
+            // If CHAP configured, find which password from local user database will be used to connect to other device
+            if ($settings['protocol'] === 'chap') $link_ppp_config[$device]['password'] = (isset($configs[$device]->users))?($configs[$device]->users[$link_ppp_config[$other_device]['username']]):(null);
+            // Check if the username/password on device matches the remote user database
+            $link_ppp_config[$device]['password_ok'] = ($configs[$other_device]->users[$settings['username']] === $link_ppp_config[$device]['password']);
+          }
+
+      switch ($layer)
+      {
+        case 'layer2': check_layer2_link($interfaces);
+                       break;
+        case 'layer3': check_layer3_link($interfaces, $serial, $link_ppp_config, $link_ppp_requirements);
+                       break;
+        default:       echo "ERROR: Unknown link type\n";
+                       exit(1);
+      }
+    }
+  }
+}
+
+################################################################################
+# STP CONFIGURATION                                                            #
+################################################################################
+# For each STP network set                                                     #
+# - Get the list of devices in the set and the expected configuration          #
+#   o For each device in the set, add the actual STP configuration for that    #
+#     device to $stp_config                                                    #
+#   o Call check_spanning_tree() with the list of device STP configs and the   #
+#     expected configuration                                                   #
+################################################################################
+function mark_stp()
+{
+  global $configs, $solution;
+
+  if (is_null($solution['stp'])) return;
+
+  print_colour('cyan', "\tSTP");
+
+  $stp_config = array();
+
+  foreach ($solution['stp'] as $device_list => $stp_details)
+  {
+    foreach (explode(':', $device_list) as $device) $stp_config[$device] = $configs[$device]->spanning_tree;
+    check_spanning_tree($stp_config, $stp_details);
+  }
+}
+
+################################################################################
+# INTERIOR ROUTING PROTOCOL CONFIGURATION                                      #
+################################################################################
+# - Create a subset of device configurations containing just the Interior      #
+#   routing protocol configurations in a more convenient format                #
+#   o Ignore devices with no routing protocol configurations                   #
+#   o For each device, loop through each configured protocol                   #
+#     - Create array $routing_configs[<protocol>[<instance>] (where instance   #
+#       is RIP version number, EIGRP AS or OSPF PID)                           #
+#     - Store list of devices that have auto summarisation enabled             #
+#     - Store list of devices that have default redistrition                   #
+#     - Store array of interfaces advertised indexed by device name            #
+#     - Store array of bad network statements indexed by device name           #
+# - Check the configuration for any protocols that have been configured that   #
+#   should not have been - check_extra_irp_protocols()                         #
+# - If there are no protocols that should be configured, we have finished our  #
+#   marking, just return                                                       #
+# - Check the configuration for any protocols that have not been configured    #
+#   that should have been - check_missing_irp_protocols()                      #
+# - Check the configuration of protocols that should, and have, been           #
+#   configured - check_required_irp_protocols()                                #
+################################################################################
+function mark_routing_interior()
+{
+  global $configs, $solution;
+
+  $routing_configs = array();
+
+  print_colour('cyan', "\trouting");
+
+  foreach ($configs as $device => $device_config)
+  {
+    if (is_null($device_config->routing_itp)) continue;
+
+    foreach ($device_config->routing_itp as $protocol => $protocol_config)
+    {
+      switch ($protocol)
+      {
+        case 'rip':   $instance = $protocol_config->version; break;
+        case 'eigrp': $instance = $protocol_config->as_number; break;
+        case 'ospf':  $instance = 1; break;
+      }
+
+      // Does this routing instance support a split network
+      if ($protocol_config->auto_summary) $routing_configs[$protocol][$instance]['auto_summary_devices'][] = $device;
+
+      if ($protocol_config->redistribute) $routing_configs[$protocol][$instance]['redistribute'][] = $device;
+      $routing_configs[$protocol][$instance]['advertise'][$device] = $protocol_config->networks;
+      foreach ($protocol_config->areas as $area => $interface_list) $routing_configs[$protocol][$instance]['ospf_areas'][$area][$device] = $interface_list;
+      $routing_configs[$protocol][$instance]['bad_network_statements'][$device] = $protocol_config->bad_network_statements;
+
+    }
+  }
+
+  check_extra_irp_protocols($routing_configs, $solution['routing_irp']);
+  if (is_null($solution['routing_irp'])) return;
+
+  check_missing_irp_protocols($routing_configs, $solution['routing_irp']);
+  check_required_irp_protocols($routing_configs, $solution['routing_irp']);
+}
+
+################################################################################
+# MARK ENTIRE EXAMINATION                                                      #
+################################################################################
+# Call individual functions in turn to mark different aspects of the exam      #
+################################################################################
+function MarkExam()
+{
+  echo "\n  Checking for Errors in...\t";
+
+  mark_devices();
+  mark_links();
+  mark_stp();
+  mark_routing_interior();
+
+  echo "\n";
+}
+
+################################################################################
+## MAIN PROGRAM STARTS FROM HERE                                              ##
+################################################################################
+// Parse command line parameters
+if ($argc != 3) 
+{
+  echo "Usage: $argv[0] <exam_config_file> <router_collection_directory>\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$collect_dir = $argv[2];
+
+################################################################################
+## LOAD EXAM CONFIGURATION, SOLUTION AND STUDENT EXAM CONFIGS                 ##
+################################################################################
+print_colour('cyan', "Checking for errors in collected exam saved at $collect_dir using exam configuration $exam_config_file\n");
+$exam_details = parse_ini_file($exam_config_file, true);
+
+$exam_options = LoadExamOptions("$collect_dir/options.ini");
+
+$solution = SetSolution();
+
+LoadDeviceConfigs($collect_dir);
+
+MarkExam();
+
+if (save_error_log("$collect_dir/errors.ini")) echo "\n  Saving configuration errors...\terrors.ini\n";;
+
+echo "\n";
+
+?>

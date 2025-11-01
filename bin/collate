@@ -1,0 +1,111 @@
+#!/usr/bin/php -f
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+##########
+# Loads student collected output and concatenates them all into one file.
+# Inputs are:
+#  $collect_dir - Base directory of student collected work
+#
+# - Create Output file
+# - For all devices in the exam
+#   o Output (to file) a large comment block with the name of the device
+#   o For each captured command for that device
+#     - Output (to file) a small comment block with the command name
+#     - Output (to file) the contents of the captured file
+# - Close the Output file
+##########
+function CollateConfigs($collect_dir)
+{
+  global $exam_info, $configs;
+
+  $fout = fopen("$collect_dir.txt", "w+");
+
+  foreach ($exam_info["Exam Details"]["devices"] as $device_name)
+  {
+    fwrite($fout, "################################################################################\n");
+    fwrite($fout, "##  COLLECTED FILES FOR: " . str_pad($device_name, 51) . "  ##\n");
+    fwrite($fout, "################################################################################\n");
+
+    foreach ($exam_info[$device_name]["commands"] as $command)
+    {
+      if ($command !== "sh run")
+      {
+        fwrite($fout, "\n\n####################\n");
+        fwrite($fout, "##  Collected Command: $command\n");
+        fwrite($fout, "####################\n");
+        fwrite($fout, "\n");
+
+        fwrite($fout, file_get_contents("$collect_dir/$device_name/" . str_replace("/", "_", str_replace("|", "-", str_replace(" ", "_", $command)))));
+        fwrite($fout, "\n");
+      }
+    }
+  }
+
+  fclose($fout);
+}
+
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+if ($argc != 3) 
+{
+  echo "Usage: $argv[0] <exam_config_file> <group_name>\n";
+  echo "
+  <exam_config_file> : Configuration file detailing whether to collate results or not
+  <group_name>       : Name of group where student results are\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$group_name = $argv[2];
+
+################################################################################
+# Use exam config file AND group name to determine "where" student configs     #
+# stored                                                                       #
+################################################################################
+$exam_info = parse_ini_file($exam_config_file, true);
+$collect_base = CollectBaseDir($cisco_configs, $exam_info) . "/$group_name";
+
+################################################################################
+# Check if we are configured to collate collected files or not                 #
+################################################################################
+if ((!isset($exam_info["Collect"])) || 
+    (!isset($exam_info["Collect"]["collate"])) ||
+    (!($exam_info["Collect"]["collate"])))
+{
+  // Not collating data, not an error
+  exit(0);
+}
+
+################################################################################
+# Get list of student IDs that were collected                                  #
+################################################################################
+$student_ids = array_map("basename", glob("$collect_base/*", GLOB_ONLYDIR));
+
+################################################################################
+# Loop through students and "just do it"                                       #
+################################################################################
+DisplayStatus(" Collating collected data ", 
+              "Collating collected data from student configs into single files per student...", 
+              $exam_info["Exam Details"]["name"]);
+
+foreach ($student_ids as $student_id)
+{
+  CollateConfigs("$collect_base/$student_id");
+}
+
+?>

@@ -1,0 +1,390 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Include libraries to access a device via the serial port                     #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/consoleserial.php");
+
+################################################################################
+# Include libraries to talk to and capture stuff from a device (password       #
+# support is still crap                                                        #
+################################################################################
+$password = "cisco";
+
+require_once("{$cisco_configs["lib_path"]}/devicecontrol.php");
+
+################################################################################
+# Servers to contact to download information about device allocation and access#
+# information from for each room in the ATC building                           #
+################################################################################
+$uncollected = array();
+$collected = array();
+$partially_collected = array();
+
+################################################################################
+#           >>>>>>>>>> CONFIGURE STUDENT LIST FUNCTIONS <<<<<<<<<<             #
+################################################################################
+# AddStudent()                                                                 #
+#                                                                              #
+# Display a form to add a new student ID to be collected. All new IDs are      #
+# stored in the global $uncollected array. If the user cancels the addition,   #
+# we just return                                                               #
+# If go-ahead is given, we check the validity of the entered student ID, and   #
+# check that it is not already in the list of students configured. If not sane,#
+# display an error dialog and return to the top.                               #
+# If all is good then we add the new ID to $uncollected before returning       #
+################################################################################
+function AddStudent()
+{
+  global $exam_details, $uncollected;
+
+  while (true)
+  {
+    $output = array();
+    exec('dialog --backtitle "' . $exam_details["Exam Details"]["name"] .  '" --stdout --colors \
+                 --title " Add Student for Collection " --insecure \
+                 --inputbox "Please enter student number:\n" 0 0',
+           $output, $result);
+
+    if ($result) return false;
+
+    $student_id = strtolower($output[0]);
+
+    // Make sure input is a valid student ID
+    if ((strlen($student_id) !== 7) || (!preg_match('/^[0-9]+[xX0-9]$/', $student_id)))
+    {
+      DisplayMessage("ERROR", "Invalid Student ID ($student_id) - ID consists of either 7 digits, or digits followed by an 'x'\n", $exam_details["Exam Details"]["name"]);
+    // Make sure input hasn't already been entered
+    } else if (in_array($student_id, $uncollected))
+    {
+      DisplayMessage("ERROR", "Configuration for this student ($student_id) already exists\n", $exam_details["Exam Details"]["name"]);
+    // All OK, add student to uncollected list
+    } else
+    {
+      $uncollected[$student_id] = "Uncollected Exam Configuration";
+      return;
+    }
+  }
+}
+
+################################################################################
+# ConfigureStudents()                                                          #
+#                                                                              #
+# Display a form to configure the list of students sitting the lab exam. The   #
+# loop runs until the user chooses to return (Done)                            #
+# If there are no student configs, we call AddStudent() to make the user enter #
+# a first configuration. If after this there is still no configs, the user has #
+# cancelled and we return                                                      #
+# A menu is displayed with all the current student IDs (sorted on ID numbers)  #
+# Available options are "Add", "Done" and "Delete", upon selection:            #
+#  Add    - Call AddStudent() to add a new entry and then return to the top of #
+#           the loop                                                           #
+#  Delete - Query if the user really wants to delete that student ID, if so    #
+#           remove the item from the $uncollected before returning to the top  #
+#           of the loop                                                        #
+#  Done   - Just return, all configured students are in the global variable    #
+#           $uncollected                                                       #
+################################################################################
+function ConfigureStudents($group_name)
+{
+  global $exam_details, $uncollected;
+
+  while (true)
+  {
+    $student_list = array();
+
+    if (count($uncollected) === 0) AddStudent();
+    if (count($uncollected) === 0) return;
+
+    ksort($uncollected, SORT_STRING);
+    //foreach ($uncollected as $student_id) $student_list[$student_id] = "Uncollected Exam Config";
+
+    $choice = DisplayMenu("Configure Student List: $group_name", 
+                          "Add a new student or select an existing student to delete",
+                          $uncollected, 
+                          $exam_details["Exam Details"]["name"],
+                          '--ok-label "Add" --cancel-label Done \
+                           --help-button --help-label Delete'
+                         );
+
+    switch ($choice->code)
+    {
+      case 0:
+        AddStudent();
+        break;
+      case 2:
+        $selected = trim($choice->output, "HELP ");
+        if (DisplayYesNo("Delete Student Confirmation", 
+                         "Are you sure that you want to delete the configuration settings for student #$selected ?\n\n",
+                          $exam_details["Exam Details"]["name"]
+                         ))
+          unset($uncollected[$selected]);
+        break;
+      default:
+        return ((count($uncollected) > 0)?true:false);
+    }
+  }
+}
+
+################################################################################
+#              >>>>>>>>>> DEVICE COLLECTION FUNCTIONS <<<<<<<<<<               #
+################################################################################
+# CollectDevice($group_name, $student_id, $device_name)                        #
+#                                                                              #
+# This function collects the output of executing all commands for the specified#
+# device for the specified student and saves the captured text in files in the #
+# correct location.                                                            #
+#                                                                              #
+# - Figure out location of capture files, based on test name, group name,      #
+#   student ID and device name                                                 #
+# - Connect to the device and try to go to enable mode. If we fail, terminate  #
+#   with failure.                                                              #
+# - We are now in enable mode                                                  #
+# - For each command we want to capture                                        #
+#   - Capture the output of the command, if the command is in the array        #
+#     $strip_bangs_commands, then ask DeviceControl() to strip the extra       #
+#     exclamation marks before returning                                       #
+#   - Write the captured text to an output file named for the captured command #
+# - Depending on the device type, clear all settings so it can be safely       #
+#   rebooted                                                                   #
+# - Return the default success code                                            #
+################################################################################
+function CollectDevice($group_name, $student_id, $device_name)
+{
+  global $cisco_configs, $exam_details, $serial, $console;
+
+  $serial_params = Array("port"     => "/dev/ttyUSB0",
+                         "speed"    => 9600,
+                         "nickname" => $device_name
+                        );
+                         
+  $strip_bangs_commands = array("show run", "sh run", "sho run");
+
+  // Get output directory for captured files for this device
+  $collect_dir = CollectBaseDir($cisco_configs, $exam_details) . "/$group_name/$student_id/$device_name/";
+  if (!file_exists($collect_dir)) mkdir($collect_dir, 0777, $recursive=TRUE);
+
+  // Connect to the device and go to enable mode. If unsuccessful, terminate with failure
+  if (($serial->Connect($serial_params)) === false) return false;
+  if ($console->GoEnable(true) === false) return false;
+
+  // In enable mode, run each command one at a time
+  foreach ($exam_details[$device_name]["commands"] as $command)
+  {
+    // Remove bogus exclamation marks if the nominated command matches our list
+    $device_output = $console->CaptureCommand($command, in_array($command, $strip_bangs_commands));
+
+    // Create output file for command and save collected content
+    $fout = fopen($collect_dir . str_replace(" ", "_", $command), "w+");
+    fwrite($fout, $device_output);
+    fclose($fout);
+  }
+
+  // Finished with device, call appropriate device clean-up function
+  switch ($exam_details[$device_name]["type"])
+  {
+    case "R": $console->EraseRouter(); break;
+    case "S": $console->EraseSwitch(); break;
+    default:  echo "  Unknown device type - not cleaning\n";
+  }
+
+  return true;
+}
+
+################################################################################
+# CollectStudent($group_name, $student_id)                                     #
+#                                                                              #
+# Collect all configs for the nominated student.                               #
+# - For each device we need to collect for:                                    #
+#   o Call CollectDevice() to collect from that device and store the configs   #
+#   o Keep count of how many devices we are unable to collect                  #
+# - No errors,           return code = 0                                       #
+# - Nothing collected,   return code = 2                                       #
+# - Something collected, return code = 1                                       #
+################################################################################
+function CollectStudent($group_name, $student_id)
+{
+  global $exam_details;
+
+  passthru("clear");
+  echo "\033[1;36;40mCollecting for student ($student_id)...\033[0;37;40m\n";
+  $error_count = 0;
+
+  foreach ($exam_details["Exam Details"]["devices"] as $device_name)
+    $error_count += (CollectDevice($group_name, $student_id, $device_name) === true)?(0):(1);
+
+  if ($error_count === 0) return 0;
+
+  if ($error_count === count($exam_details["Exam Details"]["devices"])) return 2;
+
+  return 1;
+}
+
+################################################################################
+# MarkExams()                                                                  #
+#                                                                              #
+# Display a menu allowing the user to mark/remark previously entered exam      #
+# configurations. The loop runs until the user chooses to return (to the main  #
+# menu)                                                                        #
+# The menu is a sorted (based on seat numbers) list of unmarked exam settings, #
+# followed by a sorted list of already marked exams. Marked exams are          #
+# differentiated by a '*' in front of the seat number                          #
+# There are three possibilities:                                               #
+# 1) Select an unmarked exam, we mark the exam and then move the details from  #
+#    the $unmarked() array to the $marked() array                              #
+# 2) Select a marked exam, inform the user and query if they really want to    #
+#    re-mark the exam and if so then mark it again                             #
+# 3) Finish marking. If more unmarked exams exist check with the user before   #
+#    returning to the main menu                                                #
+################################################################################
+function CollectExams($group_name)
+{
+  global $exam_details, $uncollected, $collected, $partially_collected;
+
+  while (true)
+  {
+    $items = array();
+
+    foreach ($uncollected         as $student_id => $info) $items["*$student_id"] = $info; 
+    foreach ($partially_collected as $student_id => $info) $items["*$student_id"] = $info; 
+    foreach ($collected           as $student_id => $info) $items[$student_id] = $info; 
+    ksort($items);
+
+    $choice = DisplayMenu("Collect Device Configurations: $group_name", 
+                          "Select a student to collect configurations for, collected students are moved to the bottom of the list\n",
+                          $items, 
+                          $exam_details["Exam Details"]["name"],
+                          '--ok-label "Collect" --cancel-label "Finished Collecting"');
+
+    switch ($choice->code)
+    {
+      case 0:
+        $student_id = trim($choice->output, '*');
+        $collect = false;
+
+        // Student config has not been collected yet
+        if (array_key_exists($student_id, $uncollected))
+        {
+          unset($uncollected[$student_id]);
+          $collect = true;
+        } else
+        // Student config was partially collected
+        if (array_key_exists($student_id, $partially_collected))
+        {
+          if (DisplayYesNo("Already Collected", "This students' exam has already been partially collected, are you sure that you want to re-collect it?"))
+          {
+            unset($partially_collected[$student_id]);
+            $collect = true;
+          }
+        } else
+        // Student config was successfully collected previously
+        {
+          if (DisplayYesNo("Already Collected", "This students' exam has already been collected, are you sure that you want to re-collect it?"))
+          {
+            unset($collected[$student_id]);
+            $collect = true;
+          }
+        }
+
+        // Try and collect
+        if ($collect === true)
+        {
+          switch (CollectStudent($group_name, $student_id))
+          {
+            case 0: // Successful collection
+                    $collected[$student_id] = "Successful Collection";
+                    break;
+            case 1: // Partial Collection
+                    $partially_collected[$student_id] = "Partial Collection Completed";
+                    DisplayMessage("Collection Failed", "An error occurred during collection for $student_id\n");
+                    break;
+            case 2: // Everything failed
+                    $uncollected[$student_id] = "Uncollected Exam Configuration";
+                    DisplayMessage("Collection Failed", "An error occurred during collection for $student_id\n");
+          }
+        }
+        break;
+      default:
+        if ((count($uncollected) !== 0) ||(count($partially_collected) !== 0)) return false;
+        return true;
+    }
+  }
+}
+
+################################################################################
+# MAIN PROGRAM                                                                 #
+################################################################################
+// Check command line parameters
+if (count($argv) != 3)
+{
+  echo "Usage: $argv[0] <exam_config_file> <group_name>\n";
+  echo "
+  <exam_config_file> : Configuration file detailing what to collect from what
+  <group_name>       : Name of group to store configurations under\n";
+  exit(1);
+}
+
+// Get exam configuration details
+if (($exam_details = parse_ini_file($argv[1], true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading exam_config_file ({$argv[1]})\n";
+  exit(1);
+}
+
+// Get the group name
+$group_name = $argv[2];
+
+// Make sure the exam is configured to collect via the serial cable
+if ($exam_details["Collect"]["data_source"] != "serial")
+{
+  echo "\033[1;31;40mERROR:\033[0;37;40m Exam configuration file not configured for collection over serial cable (hint: variable \'data_source\' in section \'Collect'\)\n";
+  exit(1);
+}
+
+// Get the list of students to collect exam configurations for
+ConfigureStudents($group_name);
+
+// Create classes to connect and talk to the devices
+$serial = new ConsoleSerial();
+$console = new DeviceControl($serial);
+
+// Collect everything
+while (CollectExams($group_name) === false)
+{
+  ksort($uncollected);
+  ksort($collected);
+  ksort($partially_collected);
+  $message = "------------------------------------------------------------------------------------------------------\n";
+  $message.= "Successfully collected student configs: " . implode(", ", array_keys($collected)) . "\n\n";
+  $message.= "------------------------------------------------------------------------------------------------------\n";
+  $message.= "Partially collected attempts: " . implode(", ", array_keys($partially_collected)) . "\n\n";
+  $message.= "Failed collected attempts: " . implode(", ", array_keys($uncollected)) . "\n";
+  $message.= "------------------------------------------------------------------------------------------------------\n\n";
+  $message.= "Return to collection process?\n";
+
+  if (!DisplayYesNo("Failed to collect all configs", $message, $exam_details["Exam Details"]["name"]))
+  {
+    if (DisplayYesNo("Collection Termination", 
+                     "You have chosen to terminate collection while some devices remain uncollected.\n\nDo you wish to continue the exam marking process?",
+                     $exam_details["Exam Details"]["name"]))
+      break;
+    exit(1);
+  }
+}
+
+?>

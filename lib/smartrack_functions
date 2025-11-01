@@ -1,0 +1,257 @@
+<?php
+
+####################################################################################################
+# Load the provided system_functions library                                                       #
+####################################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+if (version_compare(PHP_VERSION, '5.4.0') >= 0) {
+  require_once("{$cisco_configs["lib_path"]}/http_request.php");
+}
+
+####################################################################################################
+## This class communicates with the user to get SmartRack room selection and SIMS authentication  ##
+## information, and then communicates with the SmartRack system(s) to download device access      ##
+## information to populate a database which can later be used to actually communicate with the    ##
+## nominated devices                                                                              ##
+##                                                                                                ##
+## Constructing an instance of this class will go through the entire query/download process which ##
+## then makes the data available via the public $device_db member variable                        ##
+####################################################################################################
+class ATC_Information
+{
+  public $program_title, $multiple_rooms, $terminate_function, $server_information, $auth_details, $device_db;
+
+  ##########
+  ## Constructor
+  ##
+  ## Passed the directory containing the stored capture files
+  ## - Loop through all files in the directory reading the contents of each one that
+  ##   is an interesting file to parse to understand the configuration
+  ## - Parse the "show run" output as that sets up our base data structure
+  ## - Parse other interesting captures in turn
+  ##########
+  function __construct($program_title, $multiple_rooms, $terminate_function)
+  {
+    $this->program_title = $program_title;
+    $this->multiple_rooms = $multiple_rooms;
+    $this->terminate_function = $terminate_function;
+
+    $this->server_information = array('328' => array("shortcut"    => 8,
+                                                     "description" => "Cisco Devices in ATC328",
+                                                     "url"         => "https://ictencsvr1.ict.swin.edu.au/agent/get_all.php",
+                                                    ),
+
+                                      '329' => array("shortcut"    => 9,
+                                                     "description" => "Cisco Devices in ATC329",
+                                                     "url"         => "https://ictencsvr6.ict.swin.edu.au/agent/get_all.php",
+                                                    ),
+
+                                      '330' => array("shortcut"    => 0,
+                                                     "description" => "Cisco Devices in ATC330",
+                                                     "url"         => "https://ictencsvr11.ict.swin.edu.au/agent/get_all.php",
+                                                    )
+                                     );
+
+    $this->auth_details = null;
+    $this->device_db = array();
+
+    // Query the user for which rooms they want to access
+    $this->request_room_selection();
+
+    // Retrieve information from SmartRack about these rooms
+    $this->fetch_atc_device_details();
+  }
+  function ATC_Information($program_title, $multiple_rooms, $terminate_function)
+  {
+    $this->program_title = $program_title;
+    $this->multiple_rooms = $multiple_rooms;
+    $this->terminate_function = $terminate_function;
+
+    $this->server_information = array('328' => array("shortcut"    => 8,
+                                                     "description" => "Cisco Devices in ATC328",
+                                                     "url"         => "https://ictencsvr1.ict.swin.edu.au/agent/get_all.php",
+                                                    ),
+
+                                      '329' => array("shortcut"    => 9,
+                                                     "description" => "Cisco Devices in ATC329",
+                                                     "url"         => "https://ictencsvr6.ict.swin.edu.au/agent/get_all.php",
+                                                    ),
+
+                                      '330' => array("shortcut"    => 0,
+                                                     "description" => "Cisco Devices in ATC330",
+                                                     "url"         => "https://ictencsvr11.ict.swin.edu.au/agent/get_all.php",
+                                                    )
+                                     );
+
+    $this->auth_details = null;
+    $this->device_db = array();
+
+    // Query the user for which rooms they want to access
+    $this->request_room_selection();
+
+    // Retrieve information from SmartRack about these rooms
+    $this->fetch_atc_device_details();
+  }
+
+  ##########
+  ## request_room_selection()
+  ##
+  ## Asks the user which rooms you wish to extract device booking information from. The list of
+  ## possible rooms is in the $server_information member variable. A dialog box with a checklist of
+  ## rooms is displayed, allowing users the option of terminating the program. We loop repeatedly
+  ## until the user quits or selects at least one room. The selected rooms are used to initialise
+  ## the $device_db member variable
+  ##########
+  function request_room_selection()
+  {
+    foreach ($this->server_information as $details) $items[$details['shortcut'] = $details['description'];
+
+    while (true)
+    {
+      if ($this->multiple_rooms)
+        $choice = DisplayCheckList(" ATC Room Selection ",
+                                   "Please select in which rooms you would like to manage devices",
+                                   $items,
+                                   $this->program_title,
+                                   '--cancel-label "Quit"'
+                                  );
+      else
+        $choice = DisplayRadioList(" ATC Room Selection ",
+                                   "Please select in which rooms you would like to manage devices",
+                                   $items,
+                                   $this->program_title,
+                                   '--cancel-label "Quit"', "ATC328"
+                                  );
+
+      switch ($choice->code)
+      {
+        case 0:
+          $this->device_db = array_filter(explode(" ", $choice->output));
+          array_walk($this->device_db, create_function('&$val', '$val = trim($val, \'"\');'));
+          if (count($this->device_db) > 0) return;
+
+          DisplayMessage(" ATC Room Selection ",
+                         "ERROR: You must select at least one room with which to manage devices",
+                         $this->program_title
+                        );
+          break;
+        default:
+          $this->terminate_function();
+      }
+    }
+  }
+
+  ##########
+  ## request_auth_details()
+  ##
+  ## Asks user for their SIMS username and password, also allows user to terminate the program. We
+  ## loop repeatedly until the user quits or enters some details. Entered password is hashed out
+  ## for privacy, entered details are returned as an array
+  ##########
+  function request_auth_details()
+  {
+    while (true)
+    {
+      exec('dialog --backtitle "' . $this->program_title . '" \
+                   --stdout --colors --insecure --cancel-label "Quit" \
+                   --title " ATC Website Authentication Information " \
+                   --mixedform "Enter Swinburne SIMS Details below:\n" 25 70 15 \
+                               "Username:" 2 2 "" 2 15 50 50 0 \
+                               "Password:" 4 2 "" 4 15 50 50 1',
+           $output, $result);
+
+      switch ($result)
+      {
+        case 0:  $this->auth_details = array("username" => $output[0], "password" => $output[1]);
+                 return;
+        default: $this->terminate_function();
+      }
+    }
+  }
+
+  ##########
+  ## fetch_room_details($room)
+  ##
+  ## Connects to the URL for the specified $room using the stored authentication details and
+  ## attempts to download device details for that room. Possible outcomes are:
+  ##  - Error connecting to server, terminate program with error message
+  ##  - Authentication error, display error message and return false to force program to re-query
+  ##    user for authentication details
+  ##  - Return content of response, list of pre-formatted device details
+  ##########
+  function fetch_room_details($room)
+  {
+    $httpquery = new HttpRequest();
+
+    $httpquery->setURL($this->server_information[$room]['url']);
+    $httpquery->setMethod(HttpRequest::METH_POST);
+    $httpquery->setPostFields($this->auth_details);
+    $httpquery->send();
+
+    if ($httpquery->getResponseCode() != 200)
+    {
+      DisplayMessage(" ERROR Accessing Site ", "Unable to connect to $url, this is a terminal problem", $this->program_title);
+      exit(1);
+    }
+
+    $result = $httpquery->getResponseData();
+
+    if ($result["body"] == "Logon error\n")
+    {
+      DisplayMessage(" ERROR Authenticating ", "Bad username/password combination supplied", $this->program_title);
+      return false;
+    }
+
+    return $result["body"];
+  }
+
+  ####################################################################################################
+  # DownloadDeviceDetails($server_list, $description)                                                #
+  #                                                                                                  #
+  # Returns an array containing all the downloaded device details from the nominated ATC servers     #
+  #  - Loop through each room we are uploading to                                                    #
+  #    o Attempt to fetch the details of devices for that room                                       #
+  #      - FetchRoomDetails() will terminate on a error or return false if authentication fails      #
+  #    o While authentication fails, re-query the user for username/password                         #
+  #    o Append the returned details to $devices                                                     #
+  #  - All OK, break the downloaded data into an array for the function response                     #
+  #  - If no devices available, terminate with an error message                                      #
+  ####################################################################################################
+  function fetch_atc_device_details()
+  {
+    return; 
+    $devices = "";
+  
+    $this->request_auth_details();
+
+    foreach ($this->device_db as $room)
+    {
+      DisplayStatus(" Fetching Device Connection Details ", $this->server_information[$room]['description'], $this->program_title);
+      while (($details = $this->fetch_room_details($room) === false)
+      {
+        $this->request_auth_details();
+        DisplayStatus(" Fetching Device Connection Details ", $this->server_information[$room]['description'], $this->program_title);
+      }
+
+      $devices.= $details;
+    }
+
+    $device_list = explode("\n", trim($devices));
+
+    if (strlen($devices) > 0) return $device_list;
+
+    DisplayMessage(" ERROR retrieving device information ", "You have no booked devices to communicate with, this is a terminal problem", $this->program_title);
+    exit(1);
+  }
+
+}
+
+####################################################################################################
+####################################################################################################
+function AskTerminate($program_title)
+{
+  if (DisplayYesNo("Terminate Program", "Are you sure that you want to terminate managing these devices?", $program_title))
+    exit(1);
+}
+
+?>

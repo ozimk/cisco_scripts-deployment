@@ -1,0 +1,40 @@
+name: Create Docs PDF
+
+on:
+  push:
+    paths:
+      - docs/** 
+
+jobs:
+  convert_to_pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Pandoc
+        run: |
+          sudo apt install \
+          pandoc \
+          texlive-latex-base \
+          texlive-fonts-recommended \
+          texlive-extra-utils \
+          texlive-latex-extra \
+          texlive-xetex \
+          librsvg2-bin
+
+      - name: Convert Markdown to PDF
+        run: |
+          mkdir -p docs/pdf
+          for file in docs/*.md; do
+            base=$(basename "$file" .md)
+            pandoc "$file" -o "docs/pdf/$base.pdf"
+          done
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add docs/
+          git commit -m "Convert Markdown to PDF"
+          git push

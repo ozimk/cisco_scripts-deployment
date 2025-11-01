@@ -1,0 +1,124 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Include libraries to access a device via ssh(Swinburne ATC lab setup).       #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/consolessh.php");
+
+################################################################################
+# Include libraries to talk to and capture stuff from a device (password       #
+# support is still crap                                                        #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/devicecontrol.php");
+
+################################################################################
+# ChildProcess_UploadDevice($device_name)                                      #
+#                                                                              #
+# This function uploads the provided configurarion commands to the specified   #
+# device.                                                                      #
+#                                                                              #
+# - Connect to the device and try to go to enable mode. If we fail, terminate  #
+#   with failure.  The main loop will retry later on. As this function will    #
+#   run in a child process, we exit the process with failure                   #
+# - We are now in enable mode                                                  #
+# - Send the "conf t" command to go into configuration mode                    #
+# - Loop through each of the provided commands, sending them to the device one #
+#   at a time                                                                  #
+# - Go back to enable mode. We could send the actual commands, but it is safer #
+#   to use the pre-provided function                                           #
+# - Execute "copy run start" to save the configuration                         #
+# - Exit the child process with a success code                                 #
+################################################################################
+function UploadDevice($ssh_info, $device_commands, $copy_run_start)
+{
+  $return_code = 0;
+
+  // Create classes to connect and talk to the devices
+  $ssh = new ConsoleSSH();
+  $console = new DeviceControl($ssh);
+
+  // Connect to the device and go to enable mode. If unsuccessful, terminate with failure
+  if (($ssh->Connect($ssh_info)) === false) { $return_code = 1; goto terminate; };
+
+  if ($console->GoEnable(false) === false) { $return_code = 1; goto terminate; }
+
+  sleep(5);
+
+  // Put device in configuration mode
+  $console->UploadConfigLine("conf t");
+
+  // Upload configuration commands, one at a time (use CaptureCommand() to ensure we don't overwhelm device)
+  foreach ($device_commands as $command) $console->UploadConfigLine($command);
+
+  // Go back to enable mode 
+  // I have commented this out for use with the construct configs builder so that debugging can be turned on (this command executes HandlePrompt which does undebug all)
+  //if ($console->GoEnable(false) === false) { $return_code = 1; goto terminate; }
+
+  // If required, copy running config to startup-config
+  if ($copy_run_start)
+  {
+    $console->CaptureCommand("do copy run start"); // I have also modified this as it no longer goes to enable mode
+    $console->CaptureCommand("");
+    $console->CaptureCommand("");
+  }
+
+terminate:
+  // Pause for a bit, seems to help ensure that everything terminates cleanly without pending commands
+  sleep(1);
+  $ssh->Disconnect();
+  sleep(2);
+  return $return_code;
+}
+
+################################################################################
+# MAIN PROGRAM                                                                 #
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+// Check command line parameters
+if (($argc != 6) and (($argc != 7) and ($argv[6] !== 'save')))
+{
+  echo "Usage: $argv[0] <uri> <username> <password> <nickname> <device_config_file> [save]\n";
+  echo "
+  <uri>                : IP Address or DNS name of URI to connect to device
+  <username>           : Username to use to form ssh connection to device for upload
+  <password>           : Password to use to form ssh connection to device for upload
+  <nickname>           : Nickname of device for display purposes
+  <device_config_file> : File containing configuration information to upload to the device
+  [save]               : If the word save is specified then perform a \"copy run start\" on the device\n";
+  exit(1);
+}
+
+// Do we need to save the configuration?
+$copy_run_start = ($argc === 7);
+
+// Get list of commands to run on devices
+if (($device_commands = file($argv[5])) === false)
+{
+  echo "ERROR: Unable to load contents from provided filename \"" . $argv[5] . "\"\n";
+//  DisplayMessage(" ERROR Loading File ", "Unable to load contents from provided filename \"" . $argv[5] . "\"");
+  exit(1);
+}
+
+// Remove the 'end' command from the list of commands if it was provided (the program will take care of this)
+$device_commands = array_diff($device_commands, array("end", "end\r\n", "end\n"));
+
+// Upload device configuration and exit with outcome of process
+exit(UploadDevice(array("server" => $argv[1], "username" => $argv[2], "password" => $argv[3], "nickname" => $argv[4]), $device_commands, $copy_run_start));
+
+?>

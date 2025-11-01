@@ -1,0 +1,206 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# display_progress()                                                           #
+#                                                                              #
+# Display a progress bar with the global text stored in $progress_text and the #
+# nominated percentage completion                                              #
+################################################################################
+function display_progress($percent)
+{
+  global $exam_info, $progress_text;
+
+  exec('dialog --backtitle "' . $exam_info["Exam Details"]["name"] .  '" --stdout --colors --no-collapse \
+               --title " ZIP/Send Collected Information " \
+               --mixedgauge "' . $progress_text . '" 15 70 ' . $percent,
+       $output, $result);
+}
+
+################################################################################
+# zip_files()                                                                  #
+#                                                                              #
+# Compress all files collected for the nominated group/class. If compression   #
+# was successful, return the output file name, otherwise return false          #
+# - If the compression format has not been specified, set the default to "tgz" #
+# - Based on compression format, set both the output filename and command      #
+#   to compress the files                                                      #
+# - If incorrect compression format is specified, return an error              #
+# - Compress the collected files                                               #
+# - If compression was successful, return the new output filename              #
+# - Return false to indicate an error                                          #
+################################################################################
+function zip_files($group_name)
+{
+  global $exam_info;
+
+  if ((is_null($exam_info["ZIP_Send"]["technique"])) || (strlen($exam_info["ZIP_Send"]["technique"]) === 0)) $exam_info["ZIP_Send"]["technique"] = "tgz";
+
+  switch (strtolower($exam_info["ZIP_Send"]["technique"]))
+  {
+    case "tgz": $output_file = "$group_name.tgz"; $zip_command = "tar -czf $output_file $group_name";
+                break;
+    case "tbz": $output_file = "$group_name.tbz"; $zip_command = "tar -cjf $output_file $group_name";
+                break;
+    case "zip": $output_file = "$group_name.zip"; $zip_command = "zip -r -q $output_file $group_name";
+                break;
+    case "rar": $output_file = "$group_name.rar"; $zip_command = "rar a -r -idq $output_file $group_name";
+                break;
+    default:    DisplayMessage(" Compressing Collected Results ", "ERROR: Selected ZIPping technique ({$exam_info["ZIP_Send"]["technique"]}) is currently unknown or not supported", $exam_info["Exam Details"]["name"]);
+                return false;
+  }
+  passthru($zip_command, $result);
+
+  if ($result === 0) return $output_file;
+
+  return false;
+}
+
+################################################################################
+# get_email_destination()                                                      #
+#                                                                              #
+# Retrieve the destination email address. If the "send_to" parameter is set in #
+# the exam configuration, return that value, otherwise prompt the user to      #
+# enter their email address. In this case, set a default destination email     #
+# based on the logged-in user name                                             #
+################################################################################
+function get_email_destination()
+{
+  global $exam_info;
+
+  if ((isset($exam_info["ZIP_Send"]["send_to"])) and (strlen($exam_info["ZIP_Send"]["send_to"]) !== 0)) return $exam_info["ZIP_Send"]["send_to"];
+
+  while (true)
+  {
+    $output = array();
+
+    exec('dialog --backtitle "' . $exam_info["Exam Details"]["name"] .  '" --stdout --colors --no-cancel \
+                 --title " ZIP/Send Collected Information " \
+                 --inputbox "Please enter the email address to send the collected files to" 30 70 \
+                 "' . getenv("USER") . '@swin.edu.au"',
+         $output, $result);
+
+    if ((strlen($output[0]) > 0) && (strstr($output[0], '@') !== false)) return $output[0];
+    DisplayMessage("ERROR", "Invalid email address (" . $output[0] . ")");
+  }
+}
+
+################################################################################
+# send_email()                                                                 #
+#                                                                              #
+# Send an email with the nominated file as an attachment.                      #
+# - Call get_email_destination() to get the destination email address          #
+# - Set variables for email subject and text for body                          #
+# - Create attachment                                                          #
+# - Set the headers, append from address, optional CC "if in configuration for #
+#   the exam, specify the MIME boundary)                                       #
+# - Create the email text (body+attachment)                                    #
+# - Send email                                                                 #
+################################################################################
+function send_email($attach_file)
+{
+  global $exam_info, $group_name, $progress_text;
+
+  $email_to = get_email_destination();
+
+  $email_subject = $exam_info["Exam Details"]["name"] . " - Collected files";
+  $email_body = "Please find attached the collected files for " .  $exam_info["Exam Details"]["name"];
+
+#  $email_attachment = chunk_split(base64_encode(file_get_contents($attach_file))); 
+
+#  $mime_boundary = md5(time());
+
+#  $headers = "From: Cisco Marking Script <jbut@swin.edu.au>\r\n";
+#  if ((isset($exam_info["ZIP_Send"]["CC"])) and (strlen($exam_info["ZIP_Send"]["CC"]) !== 0)) $headers .= "CC: " . $exam_info["ZIP_Send"]["CC"] . "\r\n";
+#  $headers.= "MIME-Version: 1.0\r\n";
+#  $headers.= "Content-Type: multipart/mixed; boundary=\"$mime_boundary\"\r\n\r\n";
+
+#  $email_text = "--$mime_boundary\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n$email_body\r\n";
+#  $email_text.= "--$mime_boundary\r\nContent-Type: application/octet-stream;name=\"$attach_file\"\nContent-Transfer-Encoding: base64\r\n" . $email_attachment;
+#  $email_text.= "--$mime_boundary\r\nContent-Type: application/octet-stream;name=\"$attach_file\"\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"$attach_file\"\r\n" . $email_attachment;
+#  $email_text.= "\r\n--$mime_boundary--\r\n";
+#  echo $email_text;
+#  exit(0);
+  $progress_text .= "Sending email to:\t\t\t$email_to";
+  display_progress(50);
+
+  #mail($email_to, $email_subject, $email_text, $headers);
+
+  passthru("/bin/mailx -a \"$attach_file\" -s \"$email_subject\" $email_to <<< \"$email_body\"");
+}
+
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+if ($argc != 3) 
+{
+  echo "Usage: $argv[0] <exam_config_file> <group_name>\n";
+  echo "
+  <exam_config_file> : Configuration file detailing how to talk to ESP
+  <group_name>       : Name of group where student results are\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$group_name = $argv[2];
+
+################################################################################
+# Use exam config file AND group name to determine "where" student configs     #
+# stored                                                                       #
+################################################################################
+$exam_info = parse_ini_file($exam_config_file, true);
+
+################################################################################
+# Abort if not configured to do this                                           #
+################################################################################
+if (!isset($exam_info["ZIP_Send"]))
+{
+  DisplayMessage(" ZIP_Send Module ", "ERROR: Exam configuration file not configured for ZIPping and Sending (hint: section \'ZIP_Send'\)", $exam_info["Exam Details"]["name"]);
+  exit(1);
+}
+
+################################################################################
+# Store current directory and then change to the collection directory          # 
+################################################################################
+$current_dir = getcwd();
+
+chdir(CollectBaseDir($cisco_configs, $exam_info));
+
+################################################################################
+# ZIP files, if successful, cal send_email() to send the collected file        #
+################################################################################
+$progress_text .= "Compressing collected files for:\t$group_name\n";
+display_progress(0);
+if (($output_file = zip_files($group_name)) !== false)
+{
+  $progress_text .= "Created:\t\t\t\t$output_file\n";
+  display_progress(50);
+  send_email($output_file);
+
+  display_progress(100);
+
+  $return_code = 0;
+} else $return_code = 1;
+
+################################################################################
+# Change back to the previous directory and exit with the appropriate code     #
+################################################################################
+chdir($current_dir);
+
+exit($return_code);
+
+?>

@@ -1,0 +1,120 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Load libraries to upload results to ESP                                      #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/espcontrol.php");
+
+##########
+# Upload results for a single student to ESP
+#
+# - Open the "esp_upload" saved file and read its contents
+# - Separate the first line (score) and the rest of the file (feedback)
+# - Call the SubmitMark() method on $esp_connect() to actually submit the results
+# - Return if the result was successfully uploaded to ESP
+##########
+function upload_file($student_id, $basedir)
+{
+  global $exam_info, $esp_connect;
+
+  $filename = "$basedir/$student_id/esp_upload";
+
+  if (($file_contents = file_get_contents($filename)) === false) return false;
+
+  $results = explode("\n", $file_contents, 2);
+  sscanf($results[0], "%d", $score);
+
+#  $result = $esp_connect->SubmitMark(strtolower($student_id), $exam_info["ESP"]["assessment"], $score, $results[1]);
+  $result = $esp_connect->SubmitMark(strtolower($student_id), $exam_info["ESP"]["assessment"], $score, str_replace("'", '"', $results[1]));
+
+  return $result;
+}
+
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+if ($argc != 3) 
+{
+  echo "Usage: $argv[0] <exam_config_file> <group_name>\n";
+  echo "
+  <exam_config_file> : Configuration file detailing how to talk to ESP
+  <group_name>       : Name of group where student results are\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$group_name = $argv[2];
+
+################################################################################
+# Use exam config file AND group name to determine "where" student configs     #
+# stored                                                                       #
+################################################################################
+$exam_info = parse_ini_file($exam_config_file, true);
+$collect_dir = CollectBaseDir($cisco_configs, $exam_info) . "/$group_name";
+
+################################################################################
+if ((!isset($exam_info["ESP"])) || 
+    (!isset($exam_info["ESP"]["username"])) ||
+    (!isset($exam_info["ESP"]["password"])) ||
+    (!isset($exam_info["ESP"]["subjects"])) ||
+    (!isset($exam_info["ESP"]["assessment"])))
+{
+  echo "\033[1;31;40mERROR:\033[0;37;40m Exam configuration file not configured for ESP upload (hint: section \'ESP'\)\n";
+  exit(1);
+}
+
+
+################################################################################
+# Get list of student IDs that were collected                                  #
+################################################################################
+$student_ids = array_map("basename", glob("$collect_dir/*", GLOB_ONLYDIR));
+
+$esp_connect = new EspControl($exam_info["ESP"]["username"], $exam_info["ESP"]["password"], $exam_info["ESP"]["subjects"]);
+
+$esp_connect->Login();
+
+################################################################################
+# Execute marking script to mark each exam, return code is the student score   #
+################################################################################
+$total_students = count($student_ids);
+$progress_items['Uploading results:'] = 7;
+$progress_items['Blank line:'] = 8;
+$progress_items['Failed uploads:'] = "(None)";
+
+for ($student_index = 0; $student_index < $total_students; $student_index++)
+{
+  $student_id = $student_ids[$student_index];
+  DisplayProgress("Uploading Results to ESP for $group_name", round(100 * $student_index / $total_students), "Uploading $student_id...\n", $progress_items, $exam_info["Exam Details"]["name"]);
+  if (upload_file($student_id, $collect_dir) == false) $error_list[] = $student_id;
+  if (count($error_list) > 0) $progress_items['Failed uploads:'] = "(" . count($error_list) . ")";
+}
+
+$progress_items['Uploading results:'] = 5;
+DisplayProgress("Uploading Results to ESP for $group_name", 100, "", $progress_items, $exam_info["Exam Details"]["name"]);
+$esp_connect->Logout();
+
+if (count($error_list) > 0)
+{
+  DisplayMessage("Uploading Results to ESP for $group_name",
+                 "ERROR: Unable to upload results for the following students\n\nPlease notify the Convenor\n\n o " . implode("\n o ", $error_list),
+                 $exam_info["Exam Details"]["name"]
+                );
+  exit(1);
+}
+
+?>

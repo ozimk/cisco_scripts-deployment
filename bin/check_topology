@@ -1,0 +1,1119 @@
+#!/usr/bin/php
+<?php
+//////////////This is used for Server Sent Events, to allow the server to sent progress and ping results to the web page.
+//Currently untested as the dev environemnt has stopped code entirley for some readson!!!!.
+header('Content-Type: text/event-stream');
+header('Cache-Control: no-cache');
+//////////////////////////////////// PRoblems and how i think to fix them
+// Rememeber I have commetned out the bit that wipes the configs to do a test to chekc configs are being uploaded
+// I beleive that the chiildpds are not being removed, hence uplaod is returnign false
+// completed pings are not being added to which makes it return null so i am not getting the tests
+
+####################################################################################################
+# Load Cisco Marking Configuration Values                                                          #
+####################################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false) {
+  echo serialize(array("error" => "ERROR: Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n"));
+  exit(1);
+}
+if (version_compare(PHP_VERSION, '5.4.0') >= 0) {
+  require_once("{$cisco_configs["lib_path"]}/http_request.php");
+}
+
+####################################################################################################
+# Load the provided system_functions library                                                       #
+####################################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# Include libraries to access a device via ssh(Swinburne ATC lab setup).       #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/consolessh.php");
+
+################################################################################
+# Include libraries to talk to and capture stuff from a device (password       #
+# support is still crap                                                        #
+################################################################################
+#$password = "cisco";
+
+require_once("{$cisco_configs["lib_path"]}/devicecontrol.php");
+
+####################################################################################################
+#                    >>>>>>>>>> FETCH DEVICE INFORMATION FUNCTIONS <<<<<<<<<<                      #
+####################################################################################################
+# Servers to contact to download information about device allocation and access information from   #
+# for each room in the ATC building                                                                #
+####################################################################################################
+$atc_servers = array(
+  8 => array(
+    "description" => "Cisco Devices in ATC328",
+    "url"         => "https://ictencsvr1.ict.swin.edu.au/agent/get_all.php",
+    "name"        => "ATC328"
+  ),
+
+  9 => array(
+    "description" => "Cisco Devices in ATC329",
+    "url"         => "https://ictencsvr6.ict.swin.edu.au/agent/get_all.php",
+    "name"        => "ATC329"
+  ),
+
+  0 => array(
+    "description" => "Cisco Devices in ATC330",
+    "url"         => "https://ictencsvr11.ict.swin.edu.au/agent/get_all.php",
+    "name"        => "ATC330"
+  )
+);
+$atc_codes = array(
+  "ATC328" => 8,
+
+  "ATC329" => 9,
+
+  "ATC320" => 0
+);
+
+################################################################################
+# Menu items to help select sub-sets of devices                                #
+################################################################################
+#$rack_filters = array(".+" => "All Enclosures", "Black" => "Black Enclosure", "Red" => "Red Enclosure", "Blue" => "Blue Enclosure", "Green" => "Green Enclosure", "Yellow" => "Yellow Enclosure");
+
+#$kit_filters = array(".+" => "All Kits", "White" => "White Kit", "Purple" => "Purple Kit", "Orange" => "Orange Kit", "Green" => "Green Kit", "Yellow" => "Yellow Kit");
+
+#$device_filters = array("Router 1", "Router 2", "Router 3", "Router 4", "Switch 1", "Switch 2", "Switch 3", "Switch 4");
+
+
+####################################################################################################
+####################################################################################################
+function ParseConnections($physical)
+{
+  $result = [];
+  if(!isset($physical["Connections"]["Con"])) return $result;
+  $connections = $physical["Connections"]["Con"];
+  foreach ($connections as $con) {
+    $parts = explode(":", $con);
+    if (!isset($result[$parts[0]])) {
+      $result[$parts[0]] = [];
+    }
+    $source_interface_name = MakeShortInterfaceName(explode(".", $physical[$parts[0]]["Interfaces"][$parts[1]])[0]); // remove subinterface stuff if it was in the physical topology
+    $destination_interface_name = MakeShortInterfaceName(explode(".", $physical[$parts[2]]["Interfaces"][$parts[3]])[0]);
+    $result[$parts[0]][$source_interface_name] = array("device" => $parts[2], "interface" => $destination_interface_name, "extint" => $parts[4]);
+  }
+  return $result;
+}
+
+function get_adjacent_index($index, $other_device, $steps)
+{
+  global $rooms, $rooms_indexed;
+  $index_parts = explode("-", $index);
+  $this_device_num = $rooms[$index_parts[0]][$index_parts[1]][$index_parts[2]];
+  $new_num = $this_device_num + $steps;
+  if ($new_num < 0 || $new_num >= count($rooms_indexed)) {
+    return false;
+  }
+  $index_components = $rooms_indexed[$new_num];
+  return "{$index_components['room']}-{$index_components['enclosure']}-{$index_components['kit']}-{$other_device}";
+}
+
+
+####################################################################################################
+####################################################################################################
+function AskTerminate()
+{
+  if (DisplayYesNo("Terminate Program", "Are you sure that you want to terminate upload now?", "Upload Device Configuration"))
+    exit(1);
+}
+
+####################################################################################################
+# GetATCServerList()                                                                               #
+#                                                                                                  #
+# converts the names of the rooms to their codes used in making the request                                                                            #
+####################################################################################################
+function GetATCServerList($device_configs)
+{
+  $room_codes = array_keys($device_configs);
+  array_walk($room_codes, function (&$val) {
+    global $atc_codes;
+    $val = $atc_codes[$val];
+  });
+  return $room_codes;
+}
+
+####################################################################################################
+# GetAuthDetails()                                                                                 #
+#                                                                                                  #
+# array-ifying the username and password, kept as function for consistnecy across the atc scripts  #
+####################################################################################################
+function GetAuthDetails($username, $password)
+{
+  return array("username" => $username, "password" => $password);
+}
+
+####################################################################################################
+# FetchRoomDetails($url, $auth_details)                                                            #
+#                                                                                                  #
+# Connects to the specified URL using the provided authentication details and attempts to download #
+# device details for the corresponding room. Possible outcomes are:                                #
+#  - Error connecting to server, terminate program with error message                              #
+#  - Authentication error, display error message and return false to force program to re-query     #
+#    user for authentication details                                                               #
+#  - Return content of response, list of pre-formatted device details                              #
+####################################################################################################
+function FetchRoomDetails($url, $auth_details)
+{
+  $httpquery = new HttpRequest();
+
+  $httpquery->setURL($url);
+  $httpquery->setMethod(HttpRequest::METH_POST);
+  $httpquery->setPostFields($auth_details);
+  $httpquery->send();
+
+  if ($httpquery->getResponseCode() != 200) {
+    echo serialize(array("error" => "ERROR Accessing Site, Unable to connect to $url"));
+    exit(1);
+  }
+
+  $result = $httpquery->getResponseData();
+
+  if ($result["body"] == "Logon error\n") {
+    echo serialize(array("error" => "ERROR Authenticating, Bad username/password combination supplied"));
+    exit(1);
+  }
+
+  return $result["body"];
+}
+
+####################################################################################################
+# DownloadDeviceDetails($server_list, $description)                                                #
+#                                                                                                  #
+# Returns an array containing all the downloaded device details from the nominated ATC servers     #
+#  - Loop through each room we are uploading to                                                    #
+#    o Attempt to fetch the details of devices for that room                                       #
+#      - FetchRoomDetails() will terminate on a error or return false if authentication fails      #
+#    o While authentication fails, re-query the user for username/password                         #
+#    o Append the returned details to $devices                                                     #
+#  - All OK, break the downloaded data into an array for the function response                     #
+#  - If no devices available, terminate with an error message                                      #
+####################################################################################################
+function DownloadDeviceDetails()
+{
+  global $atc_servers, $server_list, $auth_details;
+
+  $devices = "";
+  $raw = "";
+  foreach ($server_list as $index) {
+    echo serialize(array("information" => "Fetching Device Connection Details For {$atc_servers[$index]['description']}"));
+    while (($details = FetchRoomDetails($atc_servers[$index]["url"], $auth_details)) === false) {
+      echo serialize(array("error" => "Credentials Failed for $index"));
+      exit(1);
+    }
+    $raw .= $details; //the str replace is causing a string to exist when their are no returned results so raw means we can check if any actual results were returned lik in other scripts
+    $details = str_replace("\n", "{$atc_servers[$index]['name']}:\n", $details);
+    $devices .= $details;
+  }
+  $device_list = explode("\n", trim($devices));
+  if (strlen($raw) > 0) return $device_list;
+  echo serialize(array("error" => "You have no devices available to upload to"));
+  exit(1);
+}
+
+####################################################################################################
+# Find_Config_File($enclosure, $kit, $device)                                                      #
+#                                                                                                  #
+# For the given device, return the name of the file containing the configurations that this device #
+# should be programmed with based on the values in the configuration file. While other matches     #
+# than those listed below may be possible, they are not useful so are ignored. We have priorities  #
+# to allow specific configs to overide global configuration files                                  #
+# Return stored values in the global config on the following priorities:                           #
+# - An exact match for the enclosure, kit, and device                                              #
+# - An exact match for the kit and device                                                          #
+# - An exact match for the enclosure and device                                                    #
+# - An exact match for the device only (any enclosure/kit)                                         #
+# - No matches, return an empty string                                                             #
+####################################################################################################
+// function Find_Config_File($enclosure, $kit, $device)
+// {
+//   global $device_configs;
+
+//   if (array_key_exists($enclosure, $device_configs) && array_key_exists($kit, $device_configs[$enclosure]) && array_key_exists($device, $device_configs[$enclosure][$kit]))
+//     return $device_configs[$enclosure][$kit][$device];
+
+//   if (array_key_exists('Any', $device_configs) && array_key_exists($kit, $device_configs['Any']) && array_key_exists($device, $device_configs['Any'][$kit]))
+//     return $device_configs['Any'][$kit][$device];
+
+//   if (array_key_exists($enclosure, $device_configs) && array_key_exists('Any', $device_configs[$enclosure]) && array_key_exists($device, $device_configs[$enclosure]['Any']))
+//     return $device_configs[$enclosure]['Any'][$device];
+
+//   if (array_key_exists('Any', $device_configs) && array_key_exists('Any', $device_configs['Any']) && array_key_exists($device, $device_configs['Any']['Any']))
+//     return $device_configs['Any']['Any'][$device];
+
+//   return "";
+// }
+
+####################################################################################################
+# FilterDevices($device_list)                                                                      #
+#                                                                                                  #
+# Filter the complete list of booked devices to match those specified within the configuration     #
+# file (stored in $device_configs) and create a return array storing the login details for these   #
+# devices and the filename containing the configuration to upload to each device:                  #
+# - Loop through all the devices we have booked:                                                   #
+#   o Break the string into multiple parameters separated by ':'                                   #
+#   o Locate the positions of of the open and close brackets in the $device_name, this indicates   #
+#     the colours of the Rack and Kit for this particular device                                   #
+#   o Extract information about the enclosure colour, kit colour, and device type/number           #
+#   o extract information about the room, interfaces
+####################################################################################################
+function FilterDevices($device_list)
+{
+  global $device_configs;
+
+  $result_array = array();
+  foreach ($device_list as $device_details) {
+    $detail_array = explode(":", $device_details);
+    $device_name = $detail_array[5];
+
+    $first_bracket = strpos($device_name, "(");
+    $first_bracket_end = strpos($device_name, ")");
+    $last_bracket = strrpos($device_name, "(");
+    $last_bracket_end = strrpos($device_name, ")");
+
+    $enclosure = substr($device_name, $first_bracket + 1, $first_bracket_end - $first_bracket - 1);
+    $kit = substr($device_name, $last_bracket + 1, $last_bracket_end - $last_bracket - 1);
+    # Set $device to the lower case version of string/router/asa
+    $device = trim(substr($device_name, $last_bracket_end + 2));
+    $type = strtolower(substr(trim(substr($device_name, $last_bracket_end + 2)), 0, -2));
+    if (!isset($device_configs[$detail_array[7]])) {
+      continue;
+    }
+    if (!isset($device_configs[$detail_array[7]][$enclosure])) {
+      continue;
+    }
+    if (!isset($device_configs[$detail_array[7]][$enclosure][$kit])) {
+      continue;
+    }
+    if (!isset($device_configs[$detail_array[7]][$enclosure][$kit][$device])) {
+      continue;
+    }
+
+    $interfaces = array();
+    foreach ($device_configs[$detail_array[7]][$enclosure][$kit][$device]["Interfaces"] as $link => $name) {
+      $interfaces[$link] = MakeShortInterfaceName(explode(".", $name)[0]); //clean up subinterfaces if present;
+    }
+
+    $index = "{$detail_array[7]}-$enclosure-$kit-$device";
+
+    $result_array[$index] = array(
+      "server"   => $detail_array[1],
+      "username" => $detail_array[2],
+      "password" => $detail_array[3],
+      "fullname" => $detail_array[5],
+      "nickname" => $detail_array[5],
+      "room"     => $detail_array[7],
+      "enclosure" => $enclosure,
+      "kit"      => $kit,
+      "device"   => $device,
+      "type"     => $type,
+      "interfaces" => $interfaces,
+    );
+  }
+
+  return $result_array;
+}
+
+####################################################################################################
+# FetchDeviceList()                                                                                #
+#                                                                                                  #
+# Returns a subset of devices in the ATC labs along with connection details. The subset contains   #
+# all devices to upload configs to, their connection details, and the file containing the          #
+# configuration commands                                                                           #
+# - Call GetATCServerList() to select which rooms to configure (list stored in $server_list)       #
+# - Call GetAuthDetails() to request username/password combination to use when connecting to the   #
+#   ATC servers (details stored in $auth_details)                                                  #
+# - Call DownloadDeviceDetails() to download connection details for ALL booked devices in selected #
+#   rooms (details stored in $device_list)                                                         #
+# - Return result of FilterDevices() which contains connection and config file details of the      #
+#   devices we actually need to configure                                                          #
+####################################################################################################
+function FetchDeviceList($device_configs, $username, $password)
+{
+  global $server_list, $auth_details;
+
+  $server_list = GetATCServerList($device_configs);
+  $auth_details = GetAuthDetails($username, $password);
+
+  $device_list = DownloadDeviceDetails();
+
+  return FilterDevices($device_list);
+}
+
+####################################################################################################
+#                          >>>>>>>>>> CHILD PROCESS FUNCTIONS <<<<<<<<<<                           #
+####################################################################################################
+# sig_child($signal)                                                                               #
+#                                                                                                  #
+# Called whenever a child process dies, this can happen in three ways:                             #
+#  1) success                                                                                      #
+#  2) failure                                                                                      #
+#  3) termination                                                                                  #
+#                                                                                                  #
+# Wait for a particular process to cleanup (pcntl_wait()) in a loop (so we handle all dead         #
+# processes in the handler (we return when no more terminated child processes exist. For each      #
+# terminated child process ($pid):                                                                 #
+# - Get the $device_name allocated to that child process                                           #
+# - If the process was killed, set the error_message data field in $device_db for this device to   #
+#   reflect what happened                                                                          #
+# - If the process terminated but returned failure, set the error_message data field in $device_db #
+#   for this device to reflect what happened and increment the $borked_pids count so we know how   #
+#   many have failed pre-maturely                                                                  #
+# - Otherwise the collection worked OK, we remove the $pid from the list of child PIDs so we know  #
+#   which processes are still executing                                                            #
+####################################################################################################
+function sig_child($signal)
+{
+  global $device_db, $child_pids, $borked_pids;
+
+  while (($pid = pcntl_wait($status, WNOHANG)) > 0) {
+    $device_name = $child_pids[$pid];
+
+    if (!pcntl_wifexited($status))
+      $device_db[$device_name]["error_message"] = "Upload process timed-out and was forcibly terminated";
+    else if (pcntl_wexitstatus($status) > 0) {
+      $device_db[$device_name]["error_message"] = "Upload process returned failure";
+      $borked_pids++;
+    } else {
+      unset($child_pids[$pid]);
+    }
+  }
+}
+
+####################################################################################################
+# Countdown_Delay($delay)                                                                          #
+#                                                                                                  #
+# Display a progress indicator including successful uploads, failed uploads, and a countdown timer #
+# If all uploads succeed, terminate the delay/loop, if all processes are finished (either          #
+# successfully or not) terminate the delay/loop                                                    #
+####################################################################################################
+function Countdown_Delay($delay)
+{
+  global $child_pids, $borked_pids;
+
+  $total_jobs = count($child_pids);
+
+  $progress_items = array();
+
+  $progress_items["Running wipeout:"]          = "($total_jobs)";
+  $progress_items["Failed wipeout:"]           = "(None)";
+  $progress_items["Countdown timer"] = "-100";
+
+  for ($count = $delay; $count > 0; $count--) {
+    $progress_items["Running uploads:"]          = "(" . count($child_pids) . ")";
+    if ($borked_pids > 0) $progress_items["Failed uploads:"] = "($borked_pids)";
+    $progress_items["Countdown timer"] = "-" . round(100 - (100 * $count / $delay));
+    $percent_complete = 100 - (100 * (count($child_pids) + $borked_pids) / $total_jobs);
+
+    // DisplayProgress("Upload progress", $percent_complete, "Overall percentage of completed uploads", $progress_items, "Upload Device Configuration");
+
+    // Terminate loop early if there are no more child processes running
+    if (count($child_pids) === 0) return;
+
+    // Terminate loop early if the remaining child processes are all borked
+    if ($borked_pids === count($child_pids)) return;
+
+    // Pause and continue
+    sleep(1);
+
+    pcntl_signal_dispatch();
+  }
+}
+
+####################################################################################################
+# TerminateChildren($child_pids)                                                                   #
+#                                                                                                  #
+# Terminate all children in the provided list of processes, wait for the process to actually die   #
+####################################################################################################
+function TerminateChildren($child_pids)
+{
+  global $child_pids, $borked_pids;
+
+  $total_children = count($child_pids);
+  $count = 0;
+
+  foreach ($child_pids as $pid => $device_details) {
+    if (posix_kill($pid, 0)) {
+      // DisplayProgress("Terminating Stuck Collection Processes", 100 * $count / $total_children, "Killing process $pid...\n", array(), $exam_details["Exam Details"]["name"]);
+      echo serialize(array("progress" => 100 * $count / $total_children, "information" => "Terminating Processes"));
+      posix_kill($pid, SIGINT);
+    }
+    pcntl_waitpid($pid, $status);
+
+    $count++;
+  }
+}
+
+function MakeShortInterfaceName($interface_name)
+{
+  $letter = strtolower($interface_name[0]);
+  preg_match('/[0-9]/', $interface_name, $matches, PREG_OFFSET_CAPTURE); //strpos($interface, "/");
+  $first_num = $matches[0][1]; # this should work in all cases now, the folowing is old code ->//$first_slash === false ? strlen($interface) : $first_slash; #has issiure if muli digit wiht no slash e.g. loopback10
+  $code = substr($interface_name, $first_num);
+  return $letter . $code;
+}
+
+#########################################
+# Determine Failed Tests
+# This will go through the test results and determine failure so that it can be logged
+#########################################
+function DetermineFailedTests($tests, $connections, $setups)
+{
+  global $device_db;
+  $failed = array();
+
+  foreach ($device_db as $expected_index => $expected_data) {
+    $failed[$expected_index] = array();
+    $expected_name = explode("-", $expected_index)[count(explode("-", $expected_index)) - 1];
+
+    //CHeck Device exists
+    if (!isset($tests[$expected_index]) && !isset($setups[$expected_index])) { // Check both because a if no test even tho it was setup means it didnt test becuase a neighbor failed not becuase it failed
+      $failed[$expected_index] = "$expected_index could not be uploaded to, a password might be configured or the device did not boot and enter enable mode";
+      continue;
+    }
+    if (!isset($tests[$expected_index])) {
+      $failed[$expected_index] = "The test for $expected_index did not complete, likley due to one of its neighbors not being able to be configured, see other errors, and double check this device.";
+      continue;
+    }
+
+    // Check expected interfaces are all there
+    foreach ($expected_data["interfaces"] as $expected_link => $expected_interface) {
+      // chack with cdp if the device connected to this interface is a switch;
+      $short_expected_interface = MakeShortInterfaceName($expected_interface);
+
+      
+
+      if (!isset($tests[$expected_index]["interfaces"][$expected_interface])) {
+        $failed[$expected_index][$expected_interface] = "The interface $expected_interface on $expected_index does not exist.";
+        continue;
+      }
+
+
+
+      if (!isset($connections[$expected_name][$expected_interface])) { // This is the case for loopbacks or interfaces connected to the PCs
+        if ($tests[$expected_index]["interfaces"][$expected_interface]["status"] != "up") {
+          $failed[$expected_index][$expected_interface] = "The interface $expected_interface on $expected_index is down. A connection to a PC or loopback was expected";
+          continue;
+        } else {
+          continue;
+        }
+      }
+
+
+
+      if ($connections[$expected_name][$expected_interface]['extint'] == 'in') {
+        $other_expected_index = get_adjacent_index($expected_index, $connections[$expected_name][$expected_interface]['device'], 0);
+      } else if ($connections[$expected_name][$expected_interface]['extint'] == 'next') {
+        $other_expected_index = get_adjacent_index($expected_index, $connections[$expected_name][$expected_interface]['device'], 1);
+      } else { //($interfaces['extint'] == 'prev)
+        $other_expected_index = get_adjacent_index($expected_index, $connections[$expected_name][$expected_interface]['device'], -1);
+      }
+
+      $expected_remote_interface = $connections[$expected_name][$expected_interface]["interface"];
+      $short_expected_remote_interface = trim(MakeShortInterfaceName($expected_remote_interface));
+
+      if($other_expected_index === false) {
+        //we dont plan on replciating to it so ignore this connection
+        continue;
+      }
+      
+     
+
+      // CHeck CDP
+      if (!isset($tests[$expected_index]["cdp"][$short_expected_interface])) {
+        $failed[$expected_index][$expected_interface] = "The interface $expected_interface on $expected_index is disconnected, expected connection to ". $other_expected_index . " $expected_remote_interface";
+        continue;
+      }
+
+      $short_tested_remote_interface = trim($tests[$expected_index]["cdp"][$short_expected_interface]["remote_interface"]);
+
+      if ($short_expected_remote_interface != $short_tested_remote_interface) {
+        $failed[$expected_index][$expected_interface] = "The interface $expected_interface on $expected_index is connected to the wrong interface it should be connected to " .  $other_expected_index . " $expected_remote_interface";
+        continue;
+      }
+
+
+
+      // Check Pings
+      if ($device_db[$expected_index]["type"] == "router") {
+
+        if ($tests[$expected_index]["cdp"][$short_expected_interface]["remote_device_type"] == "switch") {
+          continue; // this is connected to a switch so can't run test
+        }
+
+        if (!isset($tests[$expected_index]["ping"][$expected_interface])) {
+          $failed[$expected_index][$expected_interface] = "The ping test from interface $expected_interface on $expected_index could not be conducted";
+          continue;
+        }
+
+        if (!$tests[$expected_index]["ping"][$expected_interface]["success"]) {
+          $failed[$expected_index][$expected_interface] = "The ping test failed between " . $tests[$expected_index]["ping"][$expected_interface]["interface"] . " and " . $tests[$expected_index]["ping"][$expected_interface]["expected_interface"];
+          continue;
+        }
+      }
+    }
+
+    // CHekc that there aren't more interfaces up than there should be
+    foreach ($tests[$expected_index]["interfaces"] as $present_interface => $details) {
+
+      if($present_interface == "v1" || $present_interface == "Vlan1"){
+        continue;
+      }
+
+      $filtered_interfaces = array_filter($expected_data["interfaces"], function ($interface_name) use ($present_interface, $details) {
+        return $interface_name == $present_interface;
+      });
+      if (count($filtered_interfaces) == 0 && $details["status"] == "up") {
+        $failed[$expected_index][$present_interface] = "The interface $present_interface on $expected_index is up when it should be down";
+      }
+    }
+  }
+
+  return $failed;
+}
+
+#############################################################################
+# GetNextHops(index, connections, interface_details, setup_complete)
+# gets the next hops address and interface details for the router at index, will return false if any of the neighbors are not ready i.e. do not have interfaces setup yet
+# o index - index of the device as seen in $connections, $interface_details and $setup_complete
+# o connections - list of connection by device and interface to device and interface
+# o interface_details - list of interface and addresses indexed by $index
+# o $setup_complete - list of bolleans indexed by $Index as to whether the device is ready to be tested.
+#############################################################################
+function GetNextHops($index, $connections, $interface_details, $setup_complete)
+{
+  global $device_db, $replication;
+  $device = $device_db[$index]['device'];
+  $interfaces = $interface_details[$index];
+  $next_hops = array();
+  foreach ($interfaces as $interface => $details) { // getting next hop information based of what is conencted to the interface
+
+    if (!isset($connections[$device][$interface])) {
+      // this interface exists physically but was not in the physical template so we can ignore it because we are not interested in it
+      continue;
+    }
+
+    $other_device = $connections[$device][$interface]['device'];
+    if ((!isset($replication["Routers"]) || !in_array($other_device, $replication["Routers"]["Router"])) && (!isset($replication["Switches"]) || !in_array($other_device, $replication["Switches"]["Switch"]))) {
+      continue; // we are not interested in replicating to this device anyway so it will be ignored.
+    }
+    if ($connections[$device][$interface]['extint'] == 'in') {
+      $other_index = get_adjacent_index($index, $connections[$device][$interface]['device'], 0);
+    } else if ($connections[$device][$interface]['extint'] == 'next') {
+      $other_index = get_adjacent_index($index, $connections[$device][$interface]['device'], 1);
+    } else { //($interfaces['extint'] == 'prev)
+      $other_index = get_adjacent_index($index, $connections[$device][$interface]['device'], -1);
+    }
+    if ($other_index === false) {
+      continue;
+    } //this link is not specified physically, it is irrelevant (this would be the case for loopback interfaces, hence why we are not worried about testing them.)
+
+    if (!isset($setup_complete[$other_index]) || !$setup_complete[$other_index]) {  //the neighbour is not setup, therefor can return early
+      return false;
+    } else { //found a next hop and it is also ready to ping so we will collect its details
+      if (!isset($interface_details[$other_index][$connections[$device][$interface]['interface']])) {
+        // this interface is connected to an interface that does not exist physically (the physical template is expecting a connection to an interface that does not exist)
+        $next_hops[$interface] = array("next_hop" => null, "output_interface" => $details['full_interface'], "other_interface" => $other_index . "-" . $connections[$device][$interface]['interface']);
+        continue;
+      }
+      $other_interface = $interface_details[$other_index][$connections[$device][$interface]['interface']];
+      $next_hops[$interface] = array("next_hop" => $other_interface['address'], "output_interface" => $details['full_interface'], "other_interface" => $other_index . "-" . $other_interface["full_interface"]);
+    }
+  }
+
+  return $next_hops;
+}
+
+####################################################################################################
+# WaitToPing($child_pids, $sockets, $total_delay)                                                          #
+#                                                                                                  #
+# Here we manage the states of all the child process
+# 1. first check if child has finished uploading COnfigurations
+# 2. We can now collect its interface details and set it ready to ping
+# 3. for each oruter check all of its connected routers are ready to ping
+# 4. We can now ge the neighbors IP addresses and ping hte devices
+# 5. Check if  for the ping to conclude       
+# 6. We can now collect detials and buoild report whether ping was susccessful                               #
+####################################################################################################
+function ConductTests($child_pids, $sockets, $delay, $connections)
+{
+  global $device_db;
+  $check_num = count($child_pids);
+  $setup_complete = array();
+  $interface_details = array();
+  $test_complete = array();
+  $test_results = array();
+ 
+
+  $progress = 0;
+  // Wait for Upload
+  for ($count = $delay; $count > 0; $count--) {
+    
+    // Setup Devices For Test
+    foreach ($child_pids as $pid => $index) {
+      if (!isset($setup_complete[$index])) {
+        socket_recv($sockets[$index][1], $data, 32, MSG_DONTWAIT);
+        if (trim($data) === "SetupFinished") {
+          $setup_complete[$index] = false;
+        }
+      } else if (!$setup_complete[$index]) {
+        $serialized_ip = "";
+        while (($status = socket_recv($sockets[$index][1], $currentByte, 1, MSG_DONTWAIT) > 0) && $status !== false) {
+          $serialized_ip .= $currentByte;
+        }
+        if (trim($serialized_ip) == "") {
+          continue;
+        }
+        $ip_array = unserialize($serialized_ip);
+        $interface_details[$index] = $ip_array;
+
+        $setup_complete[$index] = true;
+        $progress++;
+      }
+    }
+
+    // Conduct Tests
+    foreach ($setup_complete as $index => $ready) {
+      if (!$ready || isset($test_complete[$index])) {
+        continue;
+      }
+      $next_hops = GetNextHops($index, $connections, $interface_details, $setup_complete);
+      if ($next_hops === false) {
+        continue;
+      }
+      $serialized_next_hops = serialize($next_hops);
+      socket_write($sockets[$index][1], $serialized_next_hops); //send all the next hop addresses for the interfaces.
+      $test_complete[$index] = false;
+      $progress++;
+    }
+
+    foreach ($test_complete as $index => $complete) {
+      if (!$complete) {
+        socket_recv($sockets[$index][1], $data, 32, MSG_DONTWAIT);
+        if (trim($data) === "TestFinished") {
+          $serialized_tests = "";
+          while (($status = socket_recv($sockets[$index][1], $currentByte, 1, MSG_DONTWAIT) > 0) && $status !== false) {
+            $serialized_tests .= $currentByte;
+          }
+          $tests = unserialize($serialized_tests);
+          $tests["interfaces"] = $interface_details[$index];
+          $test_complete[$index] = true;
+          $test_results[$index] = $tests;
+          $progress++;
+        }
+      }
+    }
+
+    $percent = ($progress / (3 * $check_num)) * 100;
+    echo serialize(array("progress" => $percent, "information" => "$percent% Is Processed"));
+    flush();
+    if (count($test_results) === $check_num) {
+      return array($test_results, $setup_complete);
+    }
+    // Pause and continue
+    sleep(1);
+
+    pcntl_signal_dispatch();
+  }
+  echo serialize(array("error" => "The Process Timeed OUt (The results may be innacurate or incomplete). Run the Test Again, it will be faster this time round."));
+  return array($test_results, $setup_complete); // here it is likley incomplete.
+}
+
+####################################################################################################
+# ChildProcess_UploadDevice($device_name)                                                          #
+#                                                                                                  #
+# This function uploads the provided configurarion commands to the specified device. The function  #
+# is executed as a child process, we terminate when complete                                       #
+# - Turn off output for clean display (otherwise parallel threads cause a mess)                    #
+# - Construct the command line call to the atc_program_device application to actually configure    #
+#   the device, then execute the command                                                           #
+# - Turn output back on and terminate the bjild process                                            #
+####################################################################################################
+function ChildProcess_UploadDevice($index, $socket)
+{
+  global $cisco_configs, $device_db;
+  ob_start();
+  $result = 0;
+  $ssh_info = array("server" => $device_db[$index]["server"], "username" => $device_db[$index]["username"], "password" => $device_db[$index]["password"], "nickname" => $device_db[$index]["nickname"]);
+  $room = $device_db[$index]["room"];
+  $interfaces_template = $device_db[$index]["interfaces"];
+  $type = $device_db[$index]["type"];
+  $uri = $device_db[$index]["server"];
+  $username = $device_db[$index]["username"];
+  $password = $device_db[$index]["password"];
+  $nickname = $device_db[$index]["nickname"];
+  /// The connetion had to be done wihtin this funciton rahter than in its iwn script lke the others due to requireing hte passing of informaiton between steps
+  //Connect to Device
+  $ssh = new ConsoleSSH();
+  $console = new DeviceControl($ssh);
+  if (($ssh->Connect($ssh_info)) === false) {
+    $result = 1;
+    goto terminate;
+  };
+  if ($console->GoEnable(false) === false) {
+    $result = 1;
+    goto terminate;
+  }
+sleep(10);
+  // Set up Devices -------------------------------------------------------
+  // Get All the interfaces present on the device and upload apropiate configs.
+  $interfaces_output = $console->CaptureCommand("show ipv6 interface brief");
+  $interface_lines = explode("\n", trim($interfaces_output));
+  $interfaces = [];
+  // process interface data
+  for ($i = 0; $i < count($interface_lines) - 1; $i += 2) { //the last will be the prompt of the device ROUTER#, and address lines is organised as [i] interface, [i+1] address
+    $interface_parts = preg_split('/\s+/', $interface_lines[$i], -1, PREG_SPLIT_NO_EMPTY);
+    $interface = trim($interface_parts[0]);
+    array_push($interfaces, $interface);
+  }
+
+  $console->UploadConfigLine("conf t");
+  if ($type == "router") {
+    $console->UploadConfigLine("ipv6 unicast-routing");
+  }
+
+  // Why must we do both? : Because if we want all the physical links to be tested, but the tphysical tempalte may also include logical links (vlan, loopback) you want to create and test.
+  foreach ($interfaces as $name) {
+    $console->UploadConfigLine("interface $name");
+    if ($type == "router") {
+      $console->UploadConfigLine("ipv6 address autoconfig");
+    }
+    $console->UploadConfigLine("no shutdown");
+  }
+  foreach ($interfaces_template as $name) {
+    $console->UploadConfigLine("interface $name");
+    if ($type == "router") {
+      $console->UploadConfigLine("ipv6 address autoconfig");
+    }
+    $console->UploadConfigLine("no shutdown");
+  }
+  sleep(1);
+
+  if ($console->GoEnable(false) === false) {
+    $result = 1;
+    goto terminate;
+  }
+  sleep(2);
+
+  socket_write($socket, str_pad("SetupFinished", 32), 32); // send that I have completed setup
+
+  // Collect Interface data
+  $addresses = $console->CaptureCommand("show ipv6 interface brief");
+  $address_lines = explode("\n", trim($addresses));
+
+  $interface_details = [];
+  // process interface data
+  for ($i = 0; $i < count($address_lines) - 1; $i += 2) { //the last will be the prompt of the device ROUTER#, and address lines is organised as [i] interface, [i+1] address
+    $interface_parts = preg_split('/\s+/', $address_lines[$i], -1, PREG_SPLIT_NO_EMPTY);
+    $address = trim($address_lines[$i + 1]);
+    $slash_pos = strpos($interface_parts[1], "/");
+    $status = substr($interface_parts[1], 1, $slash_pos - 1);
+    $interface = $interface_parts[0];
+
+    $full_interface = $interface;
+    $interface = MakeShortInterfaceName($interface);
+
+    $interface_details[$interface] = array("address" => $address, "full_interface" => $full_interface, "status" => $status);
+  }
+  //send interface data
+  $serialized_ip = serialize($interface_details);
+  socket_write($socket, $serialized_ip);
+
+  // Conduct Tests --------------------------------------------------------------------------------------
+  // Wait for Next Hop Information
+  if (socket_recv($socket, $data, 1, MSG_WAITALL | MSG_PEEK) === false) {
+    $result = 1;
+    goto terminate;
+  }
+
+  sleep(2);
+  // Get Next Hop Data
+  $serialized_next_hops = "";
+  while (($status = socket_recv($socket, $currentByte, 1, MSG_DONTWAIT) > 0) && $status !== false) {
+    $serialized_next_hops .= $currentByte;
+  }
+  $next_hops = unserialize($serialized_next_hops);
+
+  // Collect CDP data
+  $cdp_tests = array();
+  $cdp = $console->CaptureCommand("show cdp neighbor");
+  $cdp_lines = explode("\n", trim($cdp));
+
+  for ($i = 5; $i < count($cdp_lines); $i++) { // cdp output is different on every line we just want the output that has type of switch or router
+    $cdp_parts = preg_split('/\s+/', $cdp_lines[$i], -1, PREG_SPLIT_NO_EMPTY);
+    if (count($cdp_parts) == 0) {
+      continue;
+    }
+    $remote_device_type = strtolower($cdp_parts[0]);
+    if ($remote_device_type != "switch" && $remote_device_type != "router") {
+      continue;
+    }
+    $local_interface = strtolower($cdp_parts[1][0]) . $cdp_parts[2]; // The form is e.g. Gig 1/0/2 which is annoyign so modify to g1/0/2
+    $remote_interface = strtolower($cdp_parts[count($cdp_parts) - 2][0]) . $cdp_parts[count($cdp_parts) - 1];
+
+
+    $cdp_tests[$local_interface] = array("remote_device_type" => $remote_device_type, "remote_interface" => $remote_interface);
+  }
+
+  sleep(2);
+
+
+
+  $ping_tests = [];
+  // // Collect Ip Tests For Routers
+  if ($type == 'router') {
+    foreach ($next_hops as $interface => $details) {
+
+      // chack with cdp if the device connected to this interface is a switch;
+      $letter = strtolower($interface[0]);
+      preg_match('/[0-9]/', $interface, $matches, PREG_OFFSET_CAPTURE); //strpos($interface, "/");
+      $first_num = $matches[0][1]; # this should work in all cases now, the folowing is old code ->//$first_slash === false ? strlen($interface) : $first_slash; #has issiure if muli digit wiht no slash e.g. loopback10
+      $code = substr($interface, $first_num);
+      $short_interface = $letter . $code;
+
+      if (isset($cdp_tests[$short_interface]) && $cdp_tests[$short_interface]["remote_device_type"] == "switch") { // can't do a ping test with a switch
+        continue;
+      }
+
+      if ($details['next_hop'] == null) { // this happens when we were expecting a connection to an interface that wasn't physically there.
+        $ping_results[$interface] = array("success" => null, "interface" => $index . "-" . $details['output_interface'], "expected_interface" => $details["other_interface"]);
+        continue;
+      }
+
+      $strpos_check = $console->enable_prompt;
+      $console->SendCommand("");
+      $console->SendCommand("ping ipv6 {$details['next_hop']}\n{$details['output_interface']}");
+      sleep(3); // wait for ping to happen
+      $console->console->FlushInput("{$details['output_interface']}", 2);
+      $ping_result = "";
+
+      $ping_result .= $console->console->FlushInput($console->enable_prompt, 5);
+
+      while (strpos($ping_result, $strpos_check) === false) {
+        $console->SendCommand("");
+        $console->SendCommand("");
+        $ping_result .= $console->console->FlushInput($console->enable_prompt, 5);
+      }
+      $ping_tests[$interface] = array("success" => strpos($ping_result, "!") !== false, "interface" => $index . "-" . $details['output_interface'], "expected_interface" => $details["other_interface"]);
+      sleep(1);
+    }
+  }
+
+  $tests = array("cdp" => $cdp_tests, "ping" => $ping_tests);
+  socket_write($socket, str_pad("TestFinished", 32), 32); // send that I have completed tests
+  $serialized_tests = serialize($tests);
+  socket_write($socket, $serialized_tests);
+
+  terminate:
+  // Pause for a bit, seems to help ensure that everything terminates cleanly without pending commands
+  sleep(5);
+  $ssh->Disconnect();
+  sleep(2);
+  socket_close($socket);
+  ob_end_clean();
+  exit($result);
+}
+
+####################################################################################################
+#                           >>>>>>>>>> MAIN PROCESS FUNCTIONS <<<<<<<<<<                           #
+####################################################################################################
+# UploadDevices($inter_ssh_delay, $total_delay)                                                    #
+#                                                                                                  #
+# This function launches a series of child processes, one for each device to upload the nominated  #
+# configurations to. The global variable $child_pids stores a list of our children to aid in       #
+# process management while $borked_pids is a count of the processes that failed to connect to the  #
+# devices for upload purposes. The algorithm implemented in this function is:                      #
+#                                                                                                  #
+# - Loop through each device that we need to perform an upload for                                 #
+#   o Fork a child process and within the child process call ChildProcess_UploadDevice() to do the #
+#     actual dirty work. This function will terminate the child process on completion so we don't  #
+#     have to care about the outcome here                                                          #
+#   o Within the main program, store the device details in $child_pids so we can keep track of     #
+#     what we are doing                                                                            #
+#   o Sleep for the specified delay period to ensure we don't attempt to connect to too many       #
+#     devices simulataneously (overloads the sshd server and causes borked uploads :-)             #
+#                                                                                                  #
+# - Now all child processes are launched, call Countdown_Delay() to give the processes a chance to #
+#   successfully complete and terminate normally. This will return early if all processes finish,  #
+#   or return eventually ($total_delay seconds) if something is wrong                              #
+#                                                                                                  #
+# - If some child processes are still running, call TerminateChildren() to forcefully terminate    #
+#   them                                                                                           #
+#                                                                                                  #
+# - Create a new DB ($device_db) with the successful uploads removed. This allows us to recall the #
+#   function to retry the upload for the failed devices                                            #
+#                                                                                                  #
+# - Return false if an upload failed to indicate to the caller that the upload needs to be retried #
+####################################################################################################
+function UploadDevices($inter_ssh_delay, $total_delay, $connections, $physical)
+{
+  global $device_db, $child_pids, $borked_pids;
+
+  $pid = 0;
+  $borked_pids = 0;
+  $child_pids = array();
+  $sockets = array();
+  // Loop through each device in turn
+  foreach ($device_db as $index => $device_details) {
+    // Parallel processing, launch a child process to capture output from
+    // the device. This process will terminate when completed
+    $sockets[$index] = array();
+    socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $sockets[$index]);
+
+    if (($pid = pcntl_fork()) == 0) ChildProcess_UploadDevice($index, $sockets[$index][0]);
+
+    // Store the process ID so we know which devices were collected by which processes
+    $child_pids[$pid] = $index;
+
+    // Wait for next connection attempt
+    usleep($inter_ssh_delay);
+  }
+  // Check for end of upload for children
+  list($tests, $setups) = ConductTests($child_pids, $sockets, $total_delay, $connections);
+
+  $results = DetermineFailedTests($tests, $connections, $setups);
+
+
+  echo serialize(array("results" => $results));
+  flush();
+  //Wait for children report (children will kill them selves) but will need to check for stuck children
+
+  // Give upload processes a chance to succeed
+  // echo "Wariting Clean Up";
+  // Countdown_Delay($total_delay / 6);
+
+  // $child_pids contains list of processes we need to terminate
+  if (count($child_pids) > 0) TerminateChildren($child_pids);
+
+  // Use list of $child_pids to build a new, cut-down version of $device_db
+  $fail_list = array();
+  foreach ($child_pids as $pid => $index) {
+    $fail_list[$index] = $device_db[$index];
+    $fail_list[$index]["error_message"] = "Upload process was forcibly terminated";
+    unset($child_pids[$pid]);
+  }
+  $device_db = $fail_list;
+
+  // If there is still something in $device_db, we failed and need to try again
+  if (count($device_db) > 0) return false;
+}
+
+####################################################################################################
+# MAIN PROGRAM                                                                                     #
+####################################################################################################
+
+// Check command line parameters
+if (count($argv) != 5) {
+  echo serialize(array("error" => "Usage: $argv[0] <physical_file> <replication_file> <username> <password>\n"));
+
+  exit(1);
+}
+
+//Load INI file containing information about uploading instructions
+if (($physical = parse_ini_file($cisco_configs["physical_path"] . "/" . $argv[1], true)) === false) {
+  echo serialize(array("error" => "Reading Physical INI configuration file: {$argv[1]}\n"));
+  exit(1);
+}
+
+if (($replication = parse_ini_file($cisco_configs["template_path"] . "/replication/" . $argv[2], true)) === false) {
+  echo array("error" => "Reading Replication INI configuration file: {$argv[1]}\n");
+  exit(1);
+}
+
+///Organise Data
+$index = 0;
+$device_configs = [];
+$rooms = [];
+$rooms_indexed = [];
+for ($f = 0; $f < count($replication["Rooms"]["Room"]); $f++) { # Rooom Iteration   
+  $room_key = $replication["Rooms"]["Room"][$f];
+  $rooms[$room_key] = [];
+  $device_configs[$room_key] = [];
+  $racks = $replication["Racks"][$room_key] ?? $replication["Racks"]["All"];
+  if($racks == null) {echo "!!! Racks are missing for the Room $room_key, Check Replication File !!!"; exit(1);}
+  for ($g = 0; $g < count($racks); $g++) { # Rack Iteration
+    $rack_key = $racks[$g];
+    $rooms[$room_key][$rack_key] = [];
+    $device_configs[$room_key][$rack_key] = [];
+    $kits = $replication["Kits"][$rack_key] ?? $replication["Kits"]["All"];
+    if($kits == null) {echo "!!! Kits are missing for the $rack_key Rack, Check Replication File !!!"; exit(1);}
+    for ($h = 0; $h < count($kits); $h++) { #Kit Iteration
+      $kit_key = $kits[$h];
+      $rooms[$room_key][$rack_key][$kit_key] = $index;
+      $device_configs[$room_key][$rack_key][$kit_key] = [];
+
+      $rooms_indexed[$index] = array("room" => $room_key, "enclosure" => $rack_key, "kit" => $kit_key);
+      $index++;
+
+      if (isset($replication["Routers"]) && isset($replication["Routers"]["Router"])) {
+        for ($i = 0; $i < count($replication["Routers"]["Router"]); $i++) { #Router Iteration
+          $router_key = $replication["Routers"]["Router"][$i];
+          if (isset($physical[$router_key])) {
+            $device_configs[$room_key][$rack_key][$kit_key][$router_key] = $physical[$router_key];
+          } else {
+            echo serialize(array("error" => "You Intend to Replicate to $router_key, which is not specified in the wiring scheme"));
+          }
+        }
+      }
+
+      if (isset($replication["Switches"]) && isset($replication["Switches"]["Switch"])) {
+        for ($j = 0; $j < count($replication["Switches"]["Switch"]); $j++) {
+          $switch_key = $replication["Switches"]["Switch"][$j];
+          if (isset($physical[$switch_key])) {
+            $device_configs[$room_key][$rack_key][$kit_key][$switch_key] = $physical[$switch_key];
+          } else {
+            echo serialize(array("error" => "You Intend to Replicate to $switch_key, which is not specified in the wiring scheme"));
+          }
+        }
+      }
+    }
+  }
+}
+$connections = ParseConnections($physical);
+
+// Download device details to upload configs to from ATC web server
+$device_db = FetchDeviceList($device_configs, $argv[3], $argv[4]);
+// Check if i am replicating to devices that I have not booked
+foreach ($rooms_indexed as $i => $details) {
+  if (isset($replication["Routers"]) && isset($replication["Routers"]["Router"])) {
+  foreach($replication["Routers"]["Router"] as $router) {
+    $index = "{$details['room']}-{$details['enclosure']}-{$details['kit']}-{$router}";
+    if(!isset($device_db[$index]) && isset( $device_configs[$details['room']][$details['enclosure']][$details['kit']][$router] )) {
+      echo serialize(array("error" => "You Intend to Replicate to $index, which you have not booked"));
+    }
+  }
+}
+  if (isset($replication["Switches"]) && isset($replication["Switches"]["Switch"])) {
+  foreach($replication["Switches"]["Switch"] as $switch) {
+    $index = "{$details['room']}-{$details['enclosure']}-{$details['kit']}-{$switch}";
+    if(!isset($device_db[$index]) && isset( $device_configs[$details['room']][$details['enclosure']][$details['kit']][$switch] )) {
+      echo serialize(array("error" => "You Intend to Replicate to $index, which you have not booked"));
+    }
+  }
+}
+}
+
+//$device_db = ["Router 1" => 0, "Router 2" => 0, "Switch 4" => 0];
+// Install signal handler to handle when a child(collection process dies)
+
+pcntl_signal(SIGCHLD, "sig_child");
+
+// Set the two delay counters from the config file or set default values if they are not user specified
+$inter_ssh_delay = 100000;
+$total_delay     = 240 + count($rooms_indexed) * 20;
+
+//Upload everything in a loop
+while (UploadDevices($inter_ssh_delay, $total_delay, $connections, $physical) === false) {
+  foreach (array_keys($device_db) as $device_name) $message .= "<p>$device_name</p>";
+  echo serialize(array("error" => "Some child processes did not die for the following devices, likley due to an unkown error. (The test may still have been conducted, but should be double checked)" . $message));
+  flush();
+  exit(1);
+}
+
+echo serialize(array("progress" => $percent, "information" => "$percent% Is Processed"));
+
+?>

@@ -1,0 +1,353 @@
+#!/usr/bin/php
+<?php
+
+################################################################################
+# Load Cisco Marking Configuration Values                                      #
+################################################################################
+if (($cisco_configs = parse_ini_file(getenv("CISCO_PATH") . "/config.ini", true)) === false)
+{
+  echo "\n\033[1;31;40mERROR: \033[0;37;40m Reading Cisco configuration file: " . getenv("CISCO_PATH") . "/config.ini\n";
+  exit(1);
+}
+
+################################################################################
+# Load the provided system_functions library                                   #
+################################################################################
+require_once("{$cisco_configs["lib_path"]}/system_functions.php");
+
+################################################################################
+# ExamConfig class                                                             #
+#                                                                              #
+# Manages the configuration for a single exam sitting. Includes executing the  #
+# actual marking scripts that does all the real work                           #
+#  Constructor     - Initialises the internal variables for the exam settings  #
+#  DisplayString() - Returns a formatted string of exam configuration details  #
+#                    for display putposes                                      #
+#  MarkExam()      - Marks the actual exam                                     #
+################################################################################
+class ExamConfig
+{
+  public $config_file, $options;
+
+  ##########
+  # Constructor. Creates the information for one student. Provided with the
+  # fully qualified name where student options will be saved. If the file exists
+  # read the current contents, otherwise $options is NULL
+  ##########
+
+  function __construct($config_file, $exam_information_file)
+  {
+    global $exam_info;
+
+    $this->config_file = $config_file;
+    $this->exam_information_file = $exam_information_file;
+    $this->options     = NULL;
+
+    if (is_file($config_file))
+    {
+      if (($this->options = parse_ini_file($config_file)) === false) $this->options = NULL;
+    }
+  }
+
+  function ExamConfig($config_file, $exam_information_file)
+  {
+    global $exam_info;
+
+    $this->config_file = $config_file;
+    $this->exam_information_file = $exam_information_file;
+    $this->options     = NULL;
+
+    if (is_file($config_file))
+    {
+      if (($this->options = parse_ini_file($config_file)) === false) $this->options = NULL;
+    }
+  }
+
+  ##########
+  # Save the current options to the nominated file. If the options exists, they
+  # were created using the program so all options are valid, no checking is
+  # necessary
+  ##########
+  function WriteINI()
+  {
+    global $exam_info;
+
+    if (is_null($this->options)) return false;
+
+    $content = "[Student Options]\n";
+    foreach ($this->options as $variable => $value) $content .= "$variable = $value\n";
+
+    $content .= "\n\n[Marking]";
+    foreach ($exam_info["Marking"] as $variable => $value)
+    {
+      $content .= "$variable = $value\n";
+    }
+
+    file_put_contents($this->config_file, $content);
+  }
+
+  ##########
+  # Returns true if the options have been set, they are always OK since the entry
+  # function will check option validity  
+  ##########
+  function IsOK()
+  {
+    return (!is_null($this->options));
+  }
+
+  ##########
+  # Brief string displaying all configured options (for main menu)
+  ##########
+  function DisplayString()
+  {
+    global $student_options;
+
+    if (is_null($this->options)) return "-- Not Configured --";
+
+    foreach (array_keys($student_options) as $variable) $result.= "{$student_options[$variable]['description']}({$this->options[$variable]}) ";
+
+    return $result;
+  }
+}
+
+################################################################################
+# ConfigureExams()                                                             #
+#                                                                              #
+# Display a form to configure the list of students where device configurations #
+# have been collected with their individual exam configurations. The loop runs #
+# until the user chooses to quit.                                              #
+# Items are sorted in two groups, unconfigured students at the top, then those #
+# that have already been configured. Within each group they are sorted in      #
+# student_id order. A menu is displayed with two possible options:             #
+#  Edit   - Extract the chosen student_id and call EditDetails() to edit that  #
+#           entry (already configured students can be edited). Then return to  #
+#           the top of the loop                                                #
+#  Done   - Return true if all students have been configured, otherwise user   #
+#           get three options:                                                 #
+#           o Cancel    - Go back into main loop                               #
+#           o Done      - Return true, configured all we want to               #
+#           o Terminate - Return fail, don't save anything                     #
+################################################################################
+function ConfigureExams()
+{
+  global $exam_info, $exam_configs, $group_name, $options;
+
+  while (true)
+  {
+    $items = array();
+
+    foreach ($exam_configs as $student_id => $config) 
+    {
+      $items[($config->IsOK())?($student_id):("*$student_id")] = $config->DisplayString();
+    }
+    ksort($items);
+
+    $choice = DisplayMenu("Configure Lab Exams: $group_name", 
+                          "Select the exam configuration to edit",
+                          $items, 
+                          $exam_info["Exam Details"]["name"],
+                          '--ok-label "Edit" --cancel-label Done'
+                         );
+
+    switch ($choice->code)
+    {
+      case 0:
+        // Edit selected student, remove "*" from ID (for unconfigured students)
+        EditDetails(trim($choice->output, "*"));
+        break;
+
+      default:
+        // Cancel, check that all students have had settings entered
+        $result = true;
+        foreach ($exam_configs as $config) $result = $result && $config->IsOK();
+        if ($result) return $result;
+        exec('dialog --backtitle "' . $exam_info["Exam Details"]["name"] . '" --stdout --colors --no-collapse \
+                     --title " Terminate Program " --ok-label "Done" --extra-button --extra-label " Terminate " --cancel-label "Return" \
+                     --yesno "You have not configured options for all students.\nSelect \'Done\' if this is OK or \'Terminate\' to cancel marking. \'Return\' will return you to the edit menu" 0 0' ,
+             $output, $result);
+        switch ($result)
+        {
+          case 0: return true;
+          case 3: return false;
+        }
+    }
+  }
+}
+
+################################################################################
+# EditDetails($student_id)                                                     #
+#                                                                              #
+# Display a form to edit (existing) configuration options for the nominated    #
+# student.                                                                     #
+# - $options stores the current config, pre-populate it if it exists           #
+# - Loop (terminates when no errors entered by user                            #
+# - $menu_string is dyanmically created based on the variables listed in the   #
+#   exam config file. If there is only one possible value, don't display the   #
+#   field (no point if only one value can exist). The prompt for each field is #
+#   the field description and a list of allowed values.                        #
+# - Display the menu, if the user cancels, just return                         # 
+# - Loop through all possible options for the exam                             #
+#   o If there is only one value, set the corresponding entry in $options[] to #
+#     that value                                                               #
+#   o Otherwise:                                                               #
+#     - Nullify the entry in $options[]                                        #
+#     - Search for the entered value in all possible allowed values, if found  #
+#       set the $options[] entry to the nominated string for that value        #
+#     - If no match was found at all, append to the error message              #
+# - If any errors were found, display the error message, then return to the    #
+#   top of the loop, correctly entered values are remembered                   #
+# - All OK, save the entered details globally for the student and return       #
+################################################################################
+function EditDetails($student_id)
+{
+  global $exam_configs, $exam_info, $student_options;
+
+  $options = array();
+  if ($exam_configs[$student_id]->IsOK()) $options = $exam_configs[$student_id]->options;
+
+  while (true)
+  {
+    $index = 0;
+
+    $menu_string = '"Enter exam configuration details below:\n" 0 0 0 ';
+    foreach ($student_options as $variable => $option_information)
+    {
+      if (count($option_information["values"]) < 2) continue;
+
+      $menu_string.= '"' . $option_information["description"] . ' - Allowed values are: ';
+      $menu_string.= $option_information["allowed_list"] . '" ';
+      $menu_string.= (2 + (3 * $index)) . ' 2 "' .  $options[$variable] . '" ';
+      $menu_string.= (3 + (3 * $index)) . ' 2 20 0 ';
+
+      $index++;
+    }
+
+    $output = array();
+    exec('dialog --backtitle "' . $exam_info["Exam Details"]["name"] .  '" --stdout --colors \
+                 --title " Edit Exam Configuration - ' . $student_id . ' " \
+                 --ok-label "Save Changes" --insecure \
+                 --form ' . $menu_string,
+           $output, $result);
+
+    // User cancelled edit
+    if ($result) return;
+
+    // Parse entered options
+    $error_message = "";
+    $index = 0;
+    foreach ($student_options as $variable => $option_information)
+    {
+      // One possible value only
+      if (count($option_information["values"]) == 1)
+      {
+        $options[$variable] = array_shift(array_keys($option_information["values"]));
+        continue;
+      }
+
+      $options[$variable] = NULL;
+
+      // If the entered value is one of the allowed ones, set the corresponding $options[] field
+      foreach ($option_information["values"] as $stored_value => $possible_values) 
+        if (($final_value = array_search(strtolower($output[$index]), array_map('strtolower', $possible_values))) !== false) $options[$variable] = $stored_value;
+
+      // if $options[] field has not been set, then an illegal value has been entered
+      if (is_null($options[$variable])) $error_message .= "- Provided {$option_information["description"]} (" . $output[$index] . ") invalid, allowed values are: {$option_information['allowed_list']}\n";
+
+      $index++;
+    }
+
+    if (strlen($error_message) !== 0)
+    {
+      DisplayMessage("ERROR", $error_message);
+      continue;
+    }
+
+    $exam_configs[$student_id]->options = $options;
+    return;
+  }
+}
+
+################################################################################
+# MAIN PROGRAM                                                                 #
+################################################################################
+# Parse command line parameters                                                #
+################################################################################
+if ($argc != 3) 
+{
+  echo "Usage: $argv[0] <exam_config_file> <group_name>\n";
+  echo "
+  <exam_config_file> : Configuration file detailing what options can be set for each student
+  <group_name>       : Name of group where student configurations are stored\n";
+  exit(1);
+}
+
+$exam_config_file = $argv[1];
+$group_name = $argv[2];
+
+################################################################################
+# Load exam configuration file, check for errors and that a section exists to  #
+# configure this application [Exam Options]                                    #
+################################################################################
+if (($exam_info = @parse_ini_file($exam_config_file, true)) === false)
+{
+  echo "\n\033[1;31;40mERROR:\033[0;37;40m Reading exam configuration file ($exam_config_file)\n";
+  exit(1);
+}
+
+if ((!in_array("Exam Options", array_keys($exam_info))) || (count($exam_info["Exam Options"]) == 0))
+{
+  echo "\033[1;31;40mERROR:\033[0;37;40m Badly configured \'Exam Options\' section in exam configuration file ($exam_config_file)\n\n";
+  exit(1);
+}
+
+################################################################################
+# Get dynamic configuration for this application. Set array $student_options[] #
+# from detail in exam configuration file                                       #
+# $student_options["variable"] for each variable that is configurable          #
+#  ["variable"]["description"]  - Textual description for this variable        #
+#  ["variable"]["values"]       - Associative array mapping nominated value    #
+#                                 to all accepted inputs for that value        #
+#  ["variable"]["allowed_list"] - Textual representation of all allowed values #
+#                                 for this variable                            #
+################################################################################
+foreach ($exam_info["Exam Options"] as $variable => $information)
+{
+  $student_options[$variable]["description"] = $information[0];
+  $variable_list = array_slice($information, 1);
+  foreach (array_slice($information, 1) as $value_list)
+  {
+    $option = explode(",", $value_list);
+    $student_options[$variable]["values"][$option[0]] = array_map('trim', $option);
+  }
+  $student_options[$variable]["allowed_list"] = implode(", ", array_keys($student_options[$variable]["values"]));
+}
+
+################################################################################
+# Get list of student IDs that were collected                                  #
+################################################################################
+$collect_dir = CollectBaseDir($cisco_configs, $exam_info) . "/$group_name";
+$student_ids = array_map("basename", glob("$collect_dir/*", GLOB_ONLYDIR));
+
+################################################################################
+# Create list of currently configured student options                          #
+################################################################################
+$exam_configs = array();
+foreach ($student_ids as $index => $student_id) $exam_configs[$student_id] = new ExamConfig("$collect_dir/$student_id/options.ini", "$collect_dir/$student_id/exam_information.ini");
+
+################################################################################
+# Allow user to configure the options, returns false on abort, exit with       #
+# failure                                                                      #
+################################################################################
+if (ConfigureExams() == false)
+{
+  echo "\n\033[1;31;40mERROR:\033[0;37;40m Configurations not supplied for all students\n";
+  exit(1);
+}
+
+################################################################################
+# Write all configs to disk, print a warning for each student with no config   #
+################################################################################
+echo "\n\033[1;36;40mSaving Exam Options:\033[0;37;40m\n";
+foreach ($exam_configs as $student_id => $config) if ($config->WriteINI() === false) echo "\033[1;31;40mWARNING:\033[0;37;40m No configurations for student $student_id\n";
+
+?>
